@@ -15,6 +15,11 @@ mod rect;
 #[cfg(feature = "simplified-api")]
 pub mod simplified;
 mod text_attributes;
+#[cfg(test)]
+mod text_caret_tests;
+#[cfg(test)]
+mod text_change_tests;
+mod text_changes;
 mod util;
 
 pub use accesskit_consumer::NodeId;

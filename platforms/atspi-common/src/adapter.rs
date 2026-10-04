@@ -32,6 +32,7 @@ struct AdapterChangeHandler<'a> {
     added_nodes: HashSet<NodeId>,
     removed_nodes: HashSet<NodeId>,
     checked_text_change: HashSet<NodeId>,
+    checked_text_selection_change: HashSet<NodeId>,
     selection_changed: HashSet<NodeId>,
 }
 
@@ -42,6 +43,7 @@ impl<'a> AdapterChangeHandler<'a> {
             added_nodes: HashSet::new(),
             removed_nodes: HashSet::new(),
             checked_text_change: HashSet::new(),
+            checked_text_selection_change: HashSet::new(),
             selection_changed: HashSet::new(),
         }
     }
@@ -127,57 +129,13 @@ impl<'a> AdapterChangeHandler<'a> {
             return;
         }
         self.checked_text_change.insert(id);
-        let old_text = old_node.document_range().text();
-        let new_text = new_node.document_range().text();
-
-        let mut old_chars = old_text.chars();
-        let mut new_chars = new_text.chars();
-        let mut prefix_usv_count = 0;
-        let mut prefix_byte_count = 0;
-        loop {
-            match (old_chars.next(), new_chars.next()) {
-                (Some(old_char), Some(new_char)) if old_char == new_char => {
-                    prefix_usv_count += 1;
-                    prefix_byte_count += new_char.len_utf8();
-                }
-                (None, None) => return,
-                _ => break,
-            }
-        }
-
-        let suffix_byte_count = old_text[prefix_byte_count..]
-            .chars()
-            .rev()
-            .zip(new_text[prefix_byte_count..].chars().rev())
-            .take_while(|(old_char, new_char)| old_char == new_char)
-            .fold(0, |count, (c, _)| count + c.len_utf8());
-
-        let old_content = &old_text[prefix_byte_count..old_text.len() - suffix_byte_count];
-        if let Ok(length) = old_content.chars().count().try_into() {
-            if length > 0 {
-                self.adapter.emit_object_event(
-                    id,
-                    ObjectEvent::TextRemoved {
-                        start_index: prefix_usv_count,
-                        length,
-                        content: old_content.to_string(),
-                    },
-                );
-            }
-        }
-
-        let new_content = &new_text[prefix_byte_count..new_text.len() - suffix_byte_count];
-        if let Ok(length) = new_content.chars().count().try_into() {
-            if length > 0 {
-                self.adapter.emit_object_event(
-                    id,
-                    ObjectEvent::TextInserted {
-                        start_index: prefix_usv_count,
-                        length,
-                        content: new_content.to_string(),
-                    },
-                );
-            }
+        crate::text_changes::emit_text_changes(old_node, new_node, |event| {
+            self.adapter.emit_object_event(id, event);
+        });
+        // Updating an earlier run can shift this parent's global caret offset
+        // even when the parent's own data and raw selection are unchanged.
+        if filter(new_node) == FilterResult::Include {
+            self.emit_text_selection_change(Some(old_node), new_node);
         }
     }
 
@@ -194,11 +152,14 @@ impl<'a> AdapterChangeHandler<'a> {
         }
     }
 
-    fn emit_text_selection_change(&self, old_node: Option<&Node>, new_node: &Node) {
-        if !new_node.supports_text_ranges() {
+    fn emit_text_selection_change(&mut self, old_node: Option<&Node>, new_node: &Node) {
+        if !new_node.supports_text_ranges()
+            || self.checked_text_selection_change.contains(&new_node.id())
+        {
             return;
         }
         let Some(old_node) = old_node else {
+            self.checked_text_selection_change.insert(new_node.id());
             if let Some(selection) = new_node.text_selection() {
                 if !selection.is_degenerate() {
                     self.adapter
@@ -213,12 +174,28 @@ impl<'a> AdapterChangeHandler<'a> {
             }
             return;
         };
-        if !old_node.is_focused() || new_node.raw_text_selection() == old_node.raw_text_selection()
-        {
+        if !old_node.is_focused() {
             return;
         }
+        let selection_changed = new_node.raw_text_selection() != old_node.raw_text_selection();
+        let new_caret_visible = new_node.is_focused() && !new_node.is_hidden();
+        let caret_geometry_changed = new_caret_visible
+            && new_node.data().text_caret_bounds() != old_node.data().text_caret_bounds();
+        let old_caret_offset = old_node
+            .text_selection_focus()
+            .map(|focus| focus.to_global_usv_index());
+        let new_caret_offset = new_node
+            .text_selection_focus()
+            .map(|focus| focus.to_global_usv_index());
+        let caret_offset_changed = new_caret_visible && old_caret_offset != new_caret_offset;
+        if !selection_changed && !caret_geometry_changed && !caret_offset_changed {
+            return;
+        }
+        // Both parent and run callbacks can reach this node during one update.
+        // Only mark eligible changes, so gaining focus still announces a caret.
+        self.checked_text_selection_change.insert(new_node.id());
 
-        if let Some(selection) = new_node.text_selection() {
+        if let Some(selection) = new_node.text_selection().filter(|_| selection_changed) {
             if !selection.is_degenerate()
                 || old_node
                     .text_selection()
@@ -236,9 +213,14 @@ impl<'a> AdapterChangeHandler<'a> {
         let new_caret_position = new_node
             .raw_text_selection()
             .map(|selection| selection.focus);
-        if old_caret_position != new_caret_position {
-            if let Some(selection_focus) = new_node.text_selection_focus() {
-                if let Ok(offset) = selection_focus.to_global_usv_index().try_into() {
+        // Empty-cell movement changes only geometry; trimming or editing earlier
+        // text can change only the global offset. Neither changes the selection.
+        if old_caret_position != new_caret_position
+            || caret_geometry_changed
+            || caret_offset_changed
+        {
+            if let Some(new_caret_offset) = new_caret_offset {
+                if let Ok(offset) = new_caret_offset.try_into() {
                     self.adapter
                         .emit_object_event(new_node.id(), ObjectEvent::CaretMoved(offset));
                 }

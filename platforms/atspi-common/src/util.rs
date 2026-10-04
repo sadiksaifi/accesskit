@@ -107,6 +107,15 @@ pub(crate) fn text_range_from_offsets<'a>(
 
     let mut range = start.to_degenerate_range();
     range.set_end(end);
+    if node.data().text_caret_bounds().is_some() && range.is_degenerate() {
+        if let Some(focus) = node.text_selection_focus() {
+            if focus.to_global_usv_index() == range.start().to_global_usv_index() {
+                // A global offset at a run boundary loses the caret's run bias.
+                // Preserve that bias so explicit caret geometry remains reachable.
+                return Some(focus.to_degenerate_range());
+            }
+        }
+    }
     Some(range)
 }
 
