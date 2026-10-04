@@ -3209,6 +3209,7 @@ pub trait DeactivationHandler {
 mod tests {
     use super::*;
     use alloc::format;
+    use alloc::vec;
 
     #[test]
     fn shared_children_preserve_order_and_isolate_mutation() {
