@@ -19,6 +19,10 @@ pub use filters::{FilterResult, common_filter, common_filter_with_root_exception
 pub(crate) mod iterators;
 
 pub(crate) mod text;
+#[cfg(test)]
+mod text_caret_tests;
+#[cfg(test)]
+mod text_word_tests;
 pub use text::{
     Position as TextPosition, Range as TextRange, RangePropertyValue as TextRangePropertyValue,
     WeakRange as WeakTextRange,

@@ -12,6 +12,50 @@ use core::{cmp::Ordering, fmt};
 
 use crate::{FilterResult, Node, TreeState, node::NodeId};
 
+enum WordStarts<'a> {
+    Legacy(&'a [u8]),
+    Wide(&'a [u32]),
+}
+
+impl<'a> WordStarts<'a> {
+    fn new(node: &'a NodeData) -> Self {
+        match node.word_starts_u32() {
+            Some(starts) => Self::Wide(starts),
+            None => Self::Legacy(node.word_starts()),
+        }
+    }
+
+    fn binary_search(&self, character_index: usize) -> Result<usize, usize> {
+        match self {
+            Self::Legacy(starts) => starts.binary_search(&(character_index as u8)),
+            Self::Wide(starts) => match u32::try_from(character_index) {
+                Ok(index) => starts.binary_search(&index),
+                Err(_) => Err(starts.len()),
+            },
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<usize> {
+        match self {
+            Self::Legacy(starts) => starts.get(index).map(|start| usize::from(*start)),
+            Self::Wide(starts) => starts
+                .get(index)
+                .and_then(|start| usize::try_from(*start).ok()),
+        }
+    }
+
+    fn first(&self) -> Option<usize> {
+        self.get(0)
+    }
+
+    fn last(&self) -> Option<usize> {
+        match self {
+            Self::Legacy(starts) => starts.last().map(|start| usize::from(*start)),
+            Self::Wide(starts) => starts.last().and_then(|start| usize::try_from(*start).ok()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InnerPosition<'a> {
     pub(crate) node: Node<'a>,
@@ -187,12 +231,8 @@ impl<'a> Position<'a> {
 
     pub fn is_word_start(&self) -> bool {
         self.is_paragraph_start()
-            || self
-                .inner
-                .node
-                .data()
-                .word_starts()
-                .binary_search(&(self.inner.character_index as u8))
+            || WordStarts::new(self.inner.node.data())
+                .binary_search(self.inner.character_index)
                 .is_ok()
     }
 
@@ -392,8 +432,8 @@ impl<'a> Position<'a> {
         // Wrap the following in a scope to make sure we can't misuse the
         // `word_starts` local later.
         {
-            let word_starts = pos.node.data().word_starts();
-            let index = match word_starts.binary_search(&(pos.character_index as u8)) {
+            let word_starts = WordStarts::new(pos.node.data());
+            let index = match word_starts.binary_search(pos.character_index) {
                 Ok(index) => index + 1,
                 Err(index) => index,
             };
@@ -402,7 +442,7 @@ impl<'a> Position<'a> {
                     root_node: self.root_node,
                     inner: InnerPosition {
                         node: pos.node,
-                        character_index: *start as usize,
+                        character_index: start,
                     },
                 };
             }
@@ -418,12 +458,12 @@ impl<'a> Position<'a> {
             if start_pos.is_paragraph_start() {
                 return start_pos;
             }
-            if let Some(start) = node.data().word_starts().first() {
+            if let Some(start) = WordStarts::new(node.data()).first() {
                 return Self {
                     root_node: self.root_node,
                     inner: InnerPosition {
                         node,
-                        character_index: *start as usize,
+                        character_index: start,
                     },
                 };
             }
@@ -439,17 +479,20 @@ impl<'a> Position<'a> {
         // Wrap the following in a scope to make sure we can't misuse the
         // `word_starts` local later.
         {
-            let word_starts = self.inner.node.data().word_starts();
-            let index = match word_starts.binary_search(&(self.inner.character_index as u8)) {
+            let word_starts = WordStarts::new(self.inner.node.data());
+            let index = match word_starts.binary_search(self.inner.character_index) {
                 Ok(index) => index,
                 Err(index) => index,
             };
-            if let Some(index) = index.checked_sub(1) {
+            if let Some(start) = index
+                .checked_sub(1)
+                .and_then(|index| word_starts.get(index))
+            {
                 return Self {
                     root_node: self.root_node,
                     inner: InnerPosition {
                         node: self.inner.node,
-                        character_index: word_starts[index] as usize,
+                        character_index: start,
                     },
                 };
             }
@@ -467,12 +510,12 @@ impl<'a> Position<'a> {
             }
         }
         for node in self.inner.node.preceding_text_runs(&self.root_node) {
-            if let Some(start) = node.data().word_starts().last() {
+            if let Some(start) = WordStarts::new(node.data()).last() {
                 return Self {
                     root_node: self.root_node,
                     inner: InnerPosition {
                         node,
-                        character_index: *start as usize,
+                        character_index: start,
                     },
                 };
             }
@@ -738,6 +781,16 @@ impl<'a> Range<'a> {
     /// there will always be at least one box, even if it's zero-width,
     /// as it is for a degenerate range.
     pub fn bounding_boxes(&self) -> Vec<Rect> {
+        if self.is_degenerate() {
+            let caret_bounds = self.node.data().text_caret_bounds().filter(|_| {
+                self.node
+                    .text_selection_focus()
+                    .is_some_and(|focus| self.start == focus.inner)
+            });
+            if let Some(bounds) = caret_bounds {
+                return alloc::vec![self.node.transform().transform_rect_bbox(bounds)];
+            }
+        }
         let mut result = Vec::new();
         self.walk(|node| {
             let mut rect = match node.data().bounds() {

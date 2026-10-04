@@ -883,6 +883,7 @@ enum PropertyValue {
     TextSelection(Box<TextSelection>),
     CustomActionVec(Vec<CustomAction>),
     TreeId(TreeId),
+    U32Slice(Box<[u32]>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1002,6 +1003,8 @@ enum PropertyId {
     TextSelection,
     CustomActions,
     TreeId,
+    TextCaretBounds,
+    WordStartsU32,
 
     // This MUST be last.
     Unset,
@@ -1833,6 +1836,7 @@ option_ref_type_getters! {
     (get_affine_property, Affine, Affine),
     (get_string_property, str, String),
     (get_coord_slice_property, [f32], CoordSlice),
+    (get_u32_slice_property, [u32], U32Slice),
     (get_text_selection_property, TextSelection, TextSelection)
 }
 
@@ -1857,6 +1861,7 @@ box_type_setters! {
     (set_string_property, str, String),
     (set_length_slice_property, [u8], LengthSlice),
     (set_coord_slice_property, [f32], CoordSlice),
+    (set_u32_slice_property, [u32], U32Slice),
     (set_text_selection_property, TextSelection, TextSelection)
 }
 
@@ -2074,6 +2079,21 @@ length_slice_property_methods! {
     (WordStarts, word_starts, set_word_starts, clear_word_starts)
 }
 
+property_methods! {
+    /// The start index of each word in a text run, using 32-bit character
+    /// indices. Characters and word boundaries are defined as for
+    /// [`character_lengths`] and [`word_starts`]. This list must be sorted.
+    ///
+    /// When present, this property takes precedence over [`word_starts`],
+    /// including when this list is empty. This allows text runs with more than
+    /// 256 characters to expose every word boundary without truncating indices
+    /// or splitting a run. When absent, consumers use [`word_starts`] as usual.
+    ///
+    /// [`character_lengths`]: Node::character_lengths
+    /// [`word_starts`]: Node::word_starts
+    (WordStartsU32, word_starts_u32, get_u32_slice_property, Option<&[u32]>, set_word_starts_u32, set_u32_slice_property, impl Into<Box<[u32]>>, clear_word_starts_u32)
+}
+
 coord_slice_property_methods! {
     /// For text runs, this is the position of each character within
     /// the node's bounding box, in the direction given by
@@ -2178,6 +2198,19 @@ property_methods! {
 
     (TextSelection, text_selection, get_text_selection_property, Option<&TextSelection>, set_text_selection, set_text_selection_property, impl Into<Box<TextSelection>>, clear_text_selection),
 
+    /// The bounding box of the caret at the focus of this node's text selection,
+    /// in this node's coordinate space. This is independent of the bounds of the
+    /// text character at that position, allowing a terminal caret to move beyond
+    /// the end of retained text without changing the text or character geometry.
+    ///
+    /// This optional property belongs to the node that owns the text selection,
+    /// rather than to a text run. It applies only to a degenerate range at that
+    /// selection's focus. When absent, caret bounds are derived from character
+    /// positions and widths as usual. It does not affect non-degenerate ranges.
+    ///
+    /// [`transform`]: Node::transform
+    (TextCaretBounds, text_caret_bounds, get_rect_property, Option<Rect>, set_text_caret_bounds, set_rect_property, Rect, clear_text_caret_bounds),
+
     /// The tree that this node grafts. When set, this node acts as a graft
     /// point, and its child is the root of the specified subtree.
     ///
@@ -2189,7 +2222,7 @@ property_methods! {
 }
 
 impl Node {
-    option_properties_debug_method! { debug_option_properties, [transform, bounds, text_selection, tree_id,] }
+    option_properties_debug_method! { debug_option_properties, [transform, bounds, text_selection, text_caret_bounds, word_starts_u32, tree_id,] }
 }
 
 #[cfg(test)]
@@ -2252,6 +2285,61 @@ mod bounds {
 }
 
 #[cfg(test)]
+mod text_caret_bounds {
+    use super::{Node, Rect, Role};
+    use alloc::format;
+
+    const CARET: Rect = Rect {
+        x0: 50.0,
+        y0: 20.0,
+        x1: 50.0,
+        y1: 40.0,
+    };
+
+    #[test]
+    fn optional_caret_bounds_can_be_set_replaced_and_cleared() {
+        let mut node = Node::new(Role::Terminal);
+        assert_eq!(node.text_caret_bounds(), None);
+        node.set_text_caret_bounds(CARET);
+        assert_eq!(node.text_caret_bounds(), Some(CARET));
+        assert!(format!("{node:?}").contains("text_caret_bounds"));
+        node.set_text_caret_bounds(Rect { x1: 51.0, ..CARET });
+        assert_eq!(node.text_caret_bounds().unwrap().x1, 51.0);
+        node.clear_text_caret_bounds();
+        assert_eq!(node.text_caret_bounds(), None);
+        assert!(!format!("{node:?}").contains("text_caret_bounds"));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn caret_bounds_roundtrip_through_node_serialization() {
+        let mut node = Node::new(Role::Terminal);
+        node.set_text_caret_bounds(CARET);
+        let json = serde_json::to_value(&node).unwrap();
+        assert_eq!(json["properties"]["textCaretBounds"]["x0"], CARET.x0);
+        let roundtrip: Node = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, node);
+        node.clear_text_caret_bounds();
+        let json = serde_json::to_value(&node).unwrap();
+        assert!(json["properties"].get("textCaretBounds").is_none());
+        let roundtrip: Node = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip.role(), node.role());
+        assert_eq!(roundtrip.text_caret_bounds(), None);
+    }
+
+    #[cfg(feature = "schemars")]
+    #[test]
+    fn caret_bounds_are_included_in_the_node_schema() {
+        let schema = schemars::schema_for!(super::Properties);
+        assert!(
+            schema.as_value()["properties"]
+                .get("textCaretBounds")
+                .is_some()
+        );
+    }
+}
+
+#[cfg(test)]
 mod text_selection {
     use super::{Node, NodeId, Role, TextPosition, TextSelection};
 
@@ -2291,6 +2379,63 @@ mod text_selection {
         });
         node.clear_text_selection();
         assert!(node.text_selection().is_none());
+    }
+}
+
+#[cfg(test)]
+mod word_starts_u32 {
+    use super::{Node, Role};
+    use alloc::format;
+
+    #[test]
+    fn optional_wide_boundaries_preserve_legacy_data_and_distinguish_empty_from_absent() {
+        let mut node = Node::new(Role::TextRun);
+        node.set_word_starts([4]);
+        assert_eq!(node.word_starts_u32(), None);
+        node.set_word_starts_u32([0, 260, 70_000]);
+        assert_eq!(node.word_starts_u32(), Some(&[0, 260, 70_000][..]));
+        assert_eq!(node.word_starts(), &[4]);
+        assert!(format!("{node:?}").contains("word_starts_u32"));
+        node.set_word_starts_u32([]);
+        assert_eq!(node.word_starts_u32(), Some(&[][..]));
+        node.clear_word_starts_u32();
+        assert_eq!(node.word_starts_u32(), None);
+        assert_eq!(node.word_starts(), &[4]);
+        assert!(!format!("{node:?}").contains("word_starts_u32"));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn wide_boundaries_roundtrip_through_node_serialization() {
+        let mut node = Node::new(Role::TextRun);
+        node.set_word_starts([4]);
+        node.set_word_starts_u32([0, 260, 70_000]);
+        let json = serde_json::to_value(&node).unwrap();
+        assert_eq!(
+            json["properties"]["wordStartsU32"],
+            serde_json::json!([0, 260, 70_000])
+        );
+        assert_eq!(serde_json::from_value::<Node>(json).unwrap(), node);
+        node.set_word_starts_u32([]);
+        let roundtrip: Node = serde_json::from_value(serde_json::to_value(&node).unwrap()).unwrap();
+        assert_eq!(roundtrip.word_starts_u32(), Some(&[][..]));
+        node.clear_word_starts_u32();
+        let json = serde_json::to_value(&node).unwrap();
+        assert!(json["properties"].get("wordStartsU32").is_none());
+        let roundtrip: Node = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip.word_starts_u32(), None);
+        assert_eq!(roundtrip.word_starts(), &[4]);
+    }
+
+    #[cfg(feature = "schemars")]
+    #[test]
+    fn wide_boundaries_are_registered_in_the_property_schema() {
+        let schema = schemars::schema_for!(super::Properties);
+        assert!(
+            schema.as_value()["properties"]
+                .get("wordStartsU32")
+                .is_some()
+        );
     }
 }
 
@@ -2490,7 +2635,8 @@ impl Serialize for Properties {
                 Rect,
                 TextSelection,
                 CustomActionVec,
-                TreeId
+                TreeId,
+                U32Slice
             });
         }
         map.end()
@@ -2620,10 +2766,11 @@ impl<'de> Visitor<'de> for PropertiesVisitor {
                 TextAlign { TextAlign },
                 VerticalOffset { VerticalOffset },
                 Affine { Transform },
-                Rect { Bounds },
+                Rect { Bounds, TextCaretBounds },
                 TextSelection { TextSelection },
                 CustomActionVec { CustomActions },
-                TreeId { TreeId }
+                TreeId { TreeId },
+                U32Slice { WordStartsU32 }
             });
         }
 
@@ -2751,6 +2898,7 @@ impl JsonSchema for Properties {
                 CharacterLengths,
                 WordStarts
             },
+            Box<[u32]> { WordStartsU32 },
             Box<[f32]> {
                 CharacterPositions,
                 CharacterWidths
@@ -2772,7 +2920,7 @@ impl JsonSchema for Properties {
             TextAlign { TextAlign },
             VerticalOffset { VerticalOffset },
             Affine { Transform },
-            Rect { Bounds },
+            Rect { Bounds, TextCaretBounds },
             TextSelection { TextSelection },
             Vec<CustomAction> { CustomActions }
         });
