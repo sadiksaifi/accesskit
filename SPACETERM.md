@@ -26,6 +26,12 @@ dependency for the core's serialization regressions.
 - `4a27c32` `perf(text): retain incremental indexes for sparse terminal updates`
 - `4adf345` `test(text): import the vector macro for default feature builds`
 - `03cb816` `feat(macos): attach host-owned native elements to nodes`
+- `fix(macos): publish headings with the AXHeading role`
+
+The heading patch changes `Role::Heading` from `Heading` to `AXHeading` so VoiceOver can
+recognize headings. `Role::DocSubtitle` already maps to `AXHeading` in the role table and
+remains unchanged. The `heading_roles` integration test checks both roles through the macOS
+accessibility interface on the main thread.
 
 The `alloc::vec` patch adds an import required by the shared-children test when the core
 builds without its optional standard-library features. It was also applied to the retained copy

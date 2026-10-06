@@ -53,3 +53,7 @@ objc2-app-kit = { version = "0.2.0", features = [
 [[test]]
 name = "native_children"
 harness = false
+
+[[test]]
+name = "heading_roles"
+harness = false
