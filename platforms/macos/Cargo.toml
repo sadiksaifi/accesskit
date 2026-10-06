@@ -57,3 +57,7 @@ harness = false
 [[test]]
 name = "heading_roles"
 harness = false
+
+[[test]]
+name = "show_menu"
+harness = false

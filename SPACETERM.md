@@ -27,6 +27,14 @@ dependency for the core's serialization regressions.
 - `4adf345` `test(text): import the vector macro for default feature builds`
 - `03cb816` `feat(macos): attach host-owned native elements to nodes`
 - `fix(macos): publish headings with the AXHeading role`
+- `feat(macos): show context menus through AXShowMenu`
+
+The context menu patch implements `accessibilityPerformShowMenu` and allows the selector only
+when the node supports `Action::ShowContextMenu` under the adapter's filter. AppKit discovers
+`AXShowMenu` through this selector, just as it discovers `AXPress` and `AXPick`; the legacy
+`accessibilityActionNames` method continues to list only actions without modern selectors.
+The `show_menu` integration test runs on the main thread and checks Tab and Row action requests,
+unsupported nodes, and child action support inherited through a filtered container.
 
 The heading patch changes `Role::Heading` from `Heading` to `AXHeading` so VoiceOver can
 recognize headings. `Role::DocSubtitle` already maps to `AXHeading` in the role table and
