@@ -61,3 +61,7 @@ harness = false
 [[test]]
 name = "show_menu"
 harness = false
+
+[[test]]
+name = "splitter_contents"
+harness = false

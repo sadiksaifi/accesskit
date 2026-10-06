@@ -11,7 +11,7 @@
 #![allow(non_upper_case_globals)]
 
 use accesskit::{
-    Action, ActionData, ActionRequest, Orientation, Role, TextAlign, TextSelection, Toggled,
+    Action, ActionData, ActionRequest, Orientation, Rect, Role, TextAlign, TextSelection, Toggled,
 };
 use accesskit_consumer::{FilterResult, Node, NodeId, Tree};
 use objc2::{
@@ -616,6 +616,16 @@ declare_class!(
                 }
             })
             .unwrap_or(NSAccessibilityOrientation::Unknown)
+        }
+
+        #[method_id(accessibilityPreviousContents)]
+        fn previous_contents(&self) -> Option<Id<NSArray<PlatformNode>>> {
+            self.splitter_contents(SplitterSide::Previous)
+        }
+
+        #[method_id(accessibilityNextContents)]
+        fn next_contents(&self) -> Option<Id<NSArray<PlatformNode>>> {
+            self.splitter_contents(SplitterSide::Next)
         }
 
         #[method(isAccessibilityElement)]
@@ -1278,6 +1288,11 @@ declare_class!(
                         && wrapper.is_item_like()
                         && node.is_selectable();
                 }
+                if selector == sel!(accessibilityPreviousContents)
+                    || selector == sel!(accessibilityNextContents)
+                {
+                    return node.role() == Role::Splitter && node.orientation().is_some();
+                }
                 if selector == sel!(accessibilityTabs) {
                     return node.role() == Role::TabList;
                 }
@@ -1348,6 +1363,31 @@ impl PlatformNode {
         self.resolve_with_context(|node, _, _| f(node))
     }
 
+    fn splitter_contents(&self, side: SplitterSide) -> Option<Id<NSArray<PlatformNode>>> {
+        self.resolve_with_context(|node, _, context| {
+            let orientation = node.orientation()?;
+            let bounds = node.bounding_box()?;
+            // A splitter's value is its position from the leading edge, as in AppKit, so at
+            // zero it has collapsed the contents before it.
+            if matches!(side, SplitterSide::Previous) && node.numeric_value() == Some(0.0) {
+                return Some(NSArray::from_vec(Vec::new()));
+            }
+            let parent = node.filtered_parent(&filter)?;
+            let contents = parent
+                .filtered_children(filter)
+                .filter(|sibling| sibling.id() != node.id() && sibling.role() != Role::Splitter)
+                .filter(|sibling| {
+                    sibling
+                        .bounding_box()
+                        .is_some_and(|other| side.contains(orientation, bounds, other))
+                })
+                .map(|sibling| context.get_or_create_platform_node(sibling.id()))
+                .collect::<Vec<Id<PlatformNode>>>();
+            Some(NSArray::from_vec(contents))
+        })
+        .flatten()
+    }
+
     fn children_internal(&self) -> Option<Id<NSArray<NSObject>>> {
         self.resolve_with_context(|node, _, context| {
             let children = node
@@ -1361,5 +1401,38 @@ impl PlatformNode {
                 .collect::<Vec<Id<NSObject>>>();
             NSArray::from_vec(children)
         })
+    }
+}
+
+/// One side of a splitter, in the order the splitter's orientation reads.
+#[derive(Clone, Copy)]
+enum SplitterSide {
+    Previous,
+    Next,
+}
+
+impl SplitterSide {
+    /// Whether `other` lies on this side of a splitter at `bounds` and faces it across the split.
+    fn contains(self, orientation: Orientation, bounds: Rect, other: Rect) -> bool {
+        let ((start, end), (other_start, other_end), cross, other_cross) = match orientation {
+            Orientation::Vertical => (
+                (bounds.x0, bounds.x1),
+                (other.x0, other.x1),
+                (bounds.y0, bounds.y1),
+                (other.y0, other.y1),
+            ),
+            Orientation::Horizontal => (
+                (bounds.y0, bounds.y1),
+                (other.y0, other.y1),
+                (bounds.x0, bounds.x1),
+                (other.x0, other.x1),
+            ),
+        };
+        let faces = other_cross.0 < cross.1 && cross.0 < other_cross.1;
+        faces
+            && match self {
+                Self::Previous => other_start < start && other_end <= end,
+                Self::Next => other_start >= start && other_end > end,
+            }
     }
 }

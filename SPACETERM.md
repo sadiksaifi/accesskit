@@ -28,6 +28,7 @@ dependency for the core's serialization regressions.
 - `03cb816` `feat(macos): attach host-owned native elements to nodes`
 - `fix(macos): publish headings with the AXHeading role`
 - `feat(macos): show context menus through AXShowMenu`
+- `feat(macos): publish the contents on each side of a splitter`
 
 The context menu patch implements `accessibilityPerformShowMenu` and allows the selector only
 when the node supports `Action::ShowContextMenu` under the adapter's filter. AppKit discovers
@@ -35,6 +36,14 @@ when the node supports `Action::ShowContextMenu` under the adapter's filter. App
 `accessibilityActionNames` method continues to list only actions without modern selectors.
 The `show_menu` integration test runs on the main thread and checks Tab and Row action requests,
 unsupported nodes, and child action support inherited through a filtered container.
+
+The splitter patch publishes `AXPreviousContents` and `AXNextContents` for an oriented splitter,
+as AppKit's split view does. VoiceOver announces a splitter whose previous contents are empty as
+collapsed. The contents are the splitter's filtered siblings that face it across the split and lie
+wholly on one side along its axis; other splitters lie on neither side. A splitter's value is its
+position from the leading edge, as in AppKit, so a splitter at zero has no previous contents. The
+`splitter_contents` integration test checks both orientations, a filtered container, a sibling
+spanning the split, a splitter at zero, and nodes without contents on the main thread.
 
 The heading patch changes `Role::Heading` from `Heading` to `AXHeading` so VoiceOver can
 recognize headings. `Role::DocSubtitle` already maps to `AXHeading` in the role table and
