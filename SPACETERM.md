@@ -1,8 +1,9 @@
 # SpaceTerm fork
 
 SpaceTerm uses this AccessKit fork to preserve Terminal caret geometry, complete word boundaries,
-bounded AT-SPI text events, and efficient sparse text updates. Cargo pins the core, consumer, and
-AT-SPI translation crates to an immutable `spaceterm-YYYY-MM-DD` tag at
+bounded AT-SPI text events, and efficient sparse text updates, and to attach host-owned macOS
+accessibility elements to AccessKit nodes. Cargo pins the core, consumer, AT-SPI translation, and
+macOS adapter crates to an immutable `spaceterm-YYYY-MM-DD` tag at
 `https://github.com/sadiksaifi/accesskit`. Another release on the same date adds `.1`, `.2`, and so on.
 Never move or delete a published tag.
 
@@ -24,8 +25,9 @@ dependency for the core's serialization regressions.
 - `66b7c2d` `fix(atspi): preserve terminal caret geometry and bound text events`
 - `4a27c32` `perf(text): retain incremental indexes for sparse terminal updates`
 - `4adf345` `test(text): import the vector macro for default feature builds`
+- `03cb816` `feat(macos): attach host-owned native elements to nodes`
 
-The last patch adds an `alloc::vec` import required by the shared-children test when the core
+The `alloc::vec` patch adds an import required by the shared-children test when the core
 builds without its optional standard-library features. It was also applied to the retained copy
 before the final source comparison. Every retained patch test is included.
 
@@ -36,23 +38,24 @@ before the final source comparison. Every retained patch test is included.
 2. Run the validation below, then commit source and documentation changes with Conventional Commits.
 3. Create an annotated tag with `git tag -a <tag> -m 'SpaceTerm AccessKit <tag>'`, using the date
    scheme above. Push the fork branch and new tag to `sadiksaifi/accesskit`.
-4. In SpaceTerm, disable any local AccessKit override and update all three `[patch.crates-io]`
+4. In SpaceTerm, disable any local AccessKit override and update all four `[patch.crates-io]`
    entries to the published tag. Refresh the lockfile with
-   `mise exec -- cargo update -p accesskit -p accesskit_consumer -p accesskit_atspi_common`.
+   `mise exec -- cargo update -p accesskit -p accesskit_consumer -p accesskit_atspi_common -p accesskit_macos`.
 5. Run `mise run check`, `mise run lint:rust`, `mise run fmt`, `mise run test:one accesskit`, and
    `mise run test:one accessibility`. Commit the manifest and lockfile together.
 
 ## Local development
 
 In SpaceTerm, `mise run accesskit:local:on /path/to/accesskit` adds an owned `[patch.crates-io]`
-block to `.cargo/config.toml`, overriding the pinned Git sources for all three crates without
+block to `.cargo/config.toml`, overriding the pinned Git sources for all four crates without
 fetching the fork. `mise run accesskit:local:off` removes only that block and resolves the published
 tag again. Keep the local configuration addition and any local lockfile changes uncommitted.
 SpaceTerm's existing environment and local GPUI configuration are preserved.
 
 ## Validation
 
-Use SpaceTerm's Rust toolchain and an external target directory:
+Use SpaceTerm's Rust toolchain and an external target directory. The macOS adapter checks run on
+macOS only; its `native_children` test opens an AppKit window on the main thread:
 
 ```sh
 export CARGO_TARGET_DIR=/home/sdk/.worktrees/accesskit-target
@@ -60,6 +63,8 @@ mise exec rust@1.98.1 -- cargo test -p accesskit -p accesskit_consumer -p access
 mise exec rust@1.98.1 -- cargo test -p accesskit -p accesskit_consumer -p accesskit_atspi_common --features accesskit/serde,accesskit/schemars
 mise exec rust@1.98.1 -- cargo clippy -p accesskit -p accesskit_consumer -p accesskit_atspi_common --all-targets -- -D warnings
 mise exec rust@1.98.1 -- cargo clippy -p accesskit -p accesskit_consumer -p accesskit_atspi_common --all-targets --features accesskit/serde,accesskit/schemars,accesskit/enumn,accesskit_atspi_common/simplified-api -- -D warnings
+mise exec rust@1.98.1 -- cargo test -p accesskit_macos
+mise exec rust@1.98.1 -- cargo clippy -p accesskit_macos --all-targets -- -D warnings
 mise exec rust@1.98.1 -- cargo fmt --all -- --check
 ```
 
