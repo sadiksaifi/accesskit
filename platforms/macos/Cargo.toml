@@ -36,3 +36,20 @@ objc2-app-kit = { version = "0.2.0", features = [
     "NSView",
     "NSWindow",
 ] }
+
+[dev-dependencies]
+objc2-app-kit = { version = "0.2.0", features = [
+    "NSAccessibility",
+    "NSAccessibilityElement",
+    "NSAccessibilityProtocols",
+    "NSApplication",
+    "NSGraphics",
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+] }
+
+# AppKit windows require the main thread, which the default test harness does not provide.
+[[test]]
+name = "native_children"
+harness = false

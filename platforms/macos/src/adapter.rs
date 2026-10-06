@@ -4,7 +4,7 @@
 // the LICENSE-MIT file), at your option.
 
 use crate::{
-    context::{ActionHandlerNoMut, ActionHandlerWrapper, Context},
+    context::{ActionHandlerNoMut, ActionHandlerWrapper, Context, NativeChildren},
     event::{EventGenerator, QueuedEvents, focus_event},
     filters::filter,
     node::can_be_focused,
@@ -15,9 +15,14 @@ use accesskit::{
     Role, Tree as TreeData, TreeId, TreeUpdate,
 };
 use accesskit_consumer::{FilterResult, Tree};
-use objc2::rc::{Id, WeakId};
+use hashbrown::HashMap;
+use objc2::{
+    msg_send, msg_send_id,
+    rc::{Id, WeakId},
+    sel,
+};
 use objc2_app_kit::NSView;
-use objc2_foundation::{MainThreadMarker, NSArray, NSObject, NSPoint};
+use objc2_foundation::{MainThreadMarker, NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect};
 use std::fmt::{Debug, Formatter};
 use std::{ffi::c_void, ptr::null_mut, rc::Rc};
 
@@ -75,6 +80,7 @@ impl ActionHandler for PlaceholderActionHandler {
 #[derive(Debug)]
 pub struct Adapter {
     state: State,
+    native_children: NativeChildren,
 }
 
 impl Adapter {
@@ -100,7 +106,55 @@ impl Adapter {
             action_handler: Rc::new(ActionHandlerWrapper::new(action_handler)),
             mtm,
         };
-        Self { state }
+        Self {
+            state,
+            native_children: NativeChildren::default(),
+        }
+    }
+
+    /// Presents host-owned NSAccessibility elements as the trailing children of nodes in the
+    /// root tree, replacing every previous attachment. Nodes absent from `children` lose theirs.
+    ///
+    /// The host keeps implementing each element's attributes and posts its notifications.
+    /// The adapter sets each element's `accessibilityParent` to its node while the tree is
+    /// active, returns elements from hit testing within their frames, and reports an element
+    /// as focused when its node holds focus and the element answers `isAccessibilityFocused`.
+    /// Elements attached to a node that the tree filters out are not presented.
+    ///
+    /// # Safety
+    ///
+    /// Every pointer must be a valid, unreleased `NSObject` implementing the
+    /// `NSAccessibility` protocol. The adapter retains each element until it is replaced.
+    pub unsafe fn set_native_children(
+        &mut self,
+        children: impl IntoIterator<Item = (LocalNodeId, Vec<*mut c_void>)>,
+    ) {
+        let children = children
+            .into_iter()
+            .filter_map(|(node, elements)| {
+                let elements = elements
+                    .into_iter()
+                    .filter_map(|element| unsafe { Id::retain(element as *mut NSObject) })
+                    .collect::<Vec<_>>();
+                (!elements.is_empty()).then_some((node, elements))
+            })
+            .collect::<HashMap<_, _>>();
+        if let State::Active(context) = &self.state {
+            let tree = context.tree.borrow();
+            let state = tree.state();
+            for (node, elements) in &children {
+                let Some(node) = state.node_by_tree_local_id(*node, TreeId::ROOT) else {
+                    continue;
+                };
+                let parent = context.get_or_create_platform_node(node.id());
+                for element in elements {
+                    if element.respondsToSelector(sel!(setAccessibilityParent:)) {
+                        let _: () = unsafe { msg_send![element, setAccessibilityParent: &*parent] };
+                    }
+                }
+            }
+        }
+        *self.native_children.borrow_mut() = children;
     }
 
     /// If and only if the tree has been initialized, call the provided function
@@ -127,6 +181,7 @@ impl Adapter {
                     placeholder_context.view.clone(),
                     tree,
                     Rc::clone(action_handler),
+                    Rc::clone(&self.native_children),
                     placeholder_context.mtm,
                 );
                 let result = context.tree.borrow().state().focus().map(|node| {
@@ -184,7 +239,13 @@ impl Adapter {
             } => match activation_handler.request_initial_tree() {
                 Some(initial_state) => {
                     let tree = Tree::new(initial_state, *is_view_focused);
-                    let context = Context::new(view.clone(), tree, Rc::clone(action_handler), *mtm);
+                    let context = Context::new(
+                        view.clone(),
+                        tree,
+                        Rc::clone(action_handler),
+                        Rc::clone(&self.native_children),
+                        *mtm,
+                    );
                     let result = Rc::clone(&context);
                     self.state = State::Active(context);
                     result
@@ -201,6 +262,7 @@ impl Adapter {
                         view.clone(),
                         placeholder_tree,
                         Rc::new(ActionHandlerWrapper::new(PlaceholderActionHandler {})),
+                        NativeChildren::default(),
                         *mtm,
                     );
                     let result = Rc::clone(&placeholder_context);
@@ -254,6 +316,13 @@ impl Adapter {
         let state = tree.state();
         if let Some(node) = state.focus() {
             if can_be_focused(&node) {
+                let native = context.native_children(&node).into_iter().find(|element| {
+                    element.respondsToSelector(sel!(isAccessibilityFocused))
+                        && unsafe { msg_send![&**element, isAccessibilityFocused] }
+                });
+                if let Some(element) = native {
+                    return Id::autorelease_return(element);
+                }
                 return Id::autorelease_return(context.get_or_create_platform_node(node.id()))
                     as *mut _;
             }
@@ -288,8 +357,29 @@ impl Adapter {
         let tree = context.tree.borrow();
         let state = tree.state();
         let root = state.root();
-        let point = from_ns_point(&view, &root, point);
-        let node = root.node_at_point(point, &filter).unwrap_or(root);
+        let local_point = from_ns_point(&view, &root, point);
+        let node = root.node_at_point(local_point, &filter).unwrap_or(root);
+        // `point` is in screen coordinates, as are the frames of host-owned elements.
+        for element in context.native_children(&node) {
+            if !element.respondsToSelector(sel!(accessibilityFrame)) {
+                continue;
+            }
+            let frame: NSRect = unsafe { msg_send![&*element, accessibilityFrame] };
+            let contains = point.x >= frame.origin.x
+                && point.x < frame.origin.x + frame.size.width
+                && point.y >= frame.origin.y
+                && point.y < frame.origin.y + frame.size.height;
+            if !contains {
+                continue;
+            }
+            let hit: Option<Id<NSObject>> =
+                if element.respondsToSelector(sel!(accessibilityHitTest:)) {
+                    unsafe { msg_send_id![&*element, accessibilityHitTest: point] }
+                } else {
+                    None
+                };
+            return Id::autorelease_return(hit.unwrap_or(element));
+        }
         Id::autorelease_return(context.get_or_create_platform_node(node.id())) as *mut _
     }
 }

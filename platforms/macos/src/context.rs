@@ -4,12 +4,12 @@
 // the LICENSE-MIT file), at your option.
 
 use crate::node::PlatformNode;
-use accesskit::{ActionHandler, ActionRequest};
-use accesskit_consumer::{NodeId, Tree};
+use accesskit::{ActionHandler, ActionRequest, NodeId as LocalNodeId, TreeId};
+use accesskit_consumer::{Node, NodeId, Tree};
 use hashbrown::HashMap;
 use objc2::rc::{Id, WeakId};
 use objc2_app_kit::*;
-use objc2_foundation::MainThreadMarker;
+use objc2_foundation::{MainThreadMarker, NSObject};
 use std::fmt::Debug;
 use std::{cell::RefCell, rc::Rc};
 
@@ -31,11 +31,15 @@ impl<H: ActionHandler> ActionHandlerNoMut for ActionHandlerWrapper<H> {
     }
 }
 
+/// Host-owned NSAccessibility elements presented as the trailing children of root-tree nodes.
+pub(crate) type NativeChildren = Rc<RefCell<HashMap<LocalNodeId, Vec<Id<NSObject>>>>>;
+
 pub(crate) struct Context {
     pub(crate) view: WeakId<NSView>,
     pub(crate) tree: RefCell<Tree>,
     pub(crate) action_handler: Rc<dyn ActionHandlerNoMut>,
     platform_nodes: RefCell<HashMap<NodeId, Id<PlatformNode>>>,
+    native_children: NativeChildren,
     pub(crate) mtm: MainThreadMarker,
 }
 
@@ -46,6 +50,7 @@ impl Debug for Context {
             .field("tree", &self.tree)
             .field("action_handler", &"ActionHandler")
             .field("platform_nodes", &self.platform_nodes)
+            .field("native_children", &self.native_children)
             .field("mtm", &self.mtm)
             .finish()
     }
@@ -56,6 +61,7 @@ impl Context {
         view: WeakId<NSView>,
         tree: Tree,
         action_handler: Rc<dyn ActionHandlerNoMut>,
+        native_children: NativeChildren,
         mtm: MainThreadMarker,
     ) -> Rc<Self> {
         Rc::new(Self {
@@ -63,8 +69,22 @@ impl Context {
             tree: RefCell::new(tree),
             action_handler,
             platform_nodes: RefCell::new(HashMap::new()),
+            native_children,
             mtm,
         })
+    }
+
+    /// Returns the host-owned elements attached to `node`, in presentation order.
+    pub(crate) fn native_children(&self, node: &Node) -> Vec<Id<NSObject>> {
+        match node.locate() {
+            (local_id, TreeId::ROOT) => self
+                .native_children
+                .borrow()
+                .get(&local_id)
+                .cloned()
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
     }
 
     pub(crate) fn get_or_create_platform_node(self: &Rc<Self>, id: NodeId) -> Id<PlatformNode> {
