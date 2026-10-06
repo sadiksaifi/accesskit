@@ -60,9 +60,9 @@ before the final source comparison. Every retained patch test is included.
 
 ## Local development
 
-In SpaceTerm, `mise run accesskit:local:on /path/to/accesskit` adds an owned `[patch.crates-io]`
+In SpaceTerm, `mise run accesskit:local /path/to/accesskit` adds an owned `[patch.crates-io]`
 block to `.cargo/config.toml`, overriding the pinned Git sources for all four crates without
-fetching the fork. `mise run accesskit:local:off` removes only that block and resolves the published
+fetching the fork. `mise run accesskit:pinned` removes only that block and resolves the published
 tag again. Keep the local configuration addition and any local lockfile changes uncommitted.
 SpaceTerm's existing environment and local GPUI configuration are preserved.
 
