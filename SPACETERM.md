@@ -30,6 +30,7 @@ dependency for the core's serialization regressions.
 - `feat(macos): show context menus through AXShowMenu`
 - `feat(macos): publish the contents on each side of a splitter`
 - `fix(atspi): publish the application root before registry embedding`
+- `fix(atspi): start the method dispatcher before registry embedding`
 
 The context menu patch implements `accessibilityPerformShowMenu` and allows the selector only
 when the node supports `Action::ShowContextMenu` under the adapter's filter. AppKit discovers

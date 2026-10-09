@@ -44,8 +44,16 @@ impl Bus {
             _ => BusProxy::new(session_bus).await?.get_address().await?,
         };
         let address: Address = address.as_str().try_into()?;
+        Self::connect(address, executor).await
+    }
+
+    async fn connect(address: Address, executor: &Executor<'_>) -> zbus::Result<Self> {
+        let node = PlatformRoot::new(get_or_init_app_context());
         let conn = Builder::address(address)?
             .internal_executor(false)
+            // Builder waits for the method dispatcher to listen. Starting it
+            // lazily can lose the first query triggered by registry embedding.
+            .serve_at(ObjectId::Root.path(), ApplicationInterface(node))?
             .build()
             .await?;
         let conn_copy = conn.clone();
@@ -75,27 +83,26 @@ impl Bus {
     async fn register_root_node(&mut self) -> Result<()> {
         let node = PlatformRoot::new(get_or_init_app_context());
         let path = ObjectId::Root.path();
+        let registry = zbus::fdo::DBusProxy::new(&self.conn)
+            .await?
+            .get_name_owner(self.socket_proxy.inner().destination().to_owned())
+            .await?;
 
         if self
             .conn
             .object_server()
-            .at(path.clone(), ApplicationInterface(node.clone()))
+            .at(
+                path,
+                RootAccessibleInterface::new(
+                    self.unique_name().to_owned(),
+                    node.clone(),
+                    Arc::clone(&self.desktop),
+                    ObjectId::Root.to_address(registry.inner()),
+                ),
+            )
             .await?
         {
-            // Embed announces the application to clients before its reply arrives.
-            // Serve root queries before that announcement can trigger them.
-            self.conn
-                .object_server()
-                .at(
-                    path,
-                    RootAccessibleInterface::new(
-                        self.unique_name().to_owned(),
-                        node.clone(),
-                        Arc::clone(&self.desktop),
-                    ),
-                )
-                .await?;
-
+            // Embed announces the application before its reply arrives.
             let desktop = self
                 .socket_proxy
                 .embed(&(self.unique_name().as_str(), ObjectId::Root.path().into()))
@@ -498,6 +505,7 @@ mod tests {
     }
 
     struct Registry;
+    const DESKTOP_PATH: &str = "/org/a11y/atspi/accessible/desktop";
 
     #[interface(name = "org.a11y.atspi.Socket")]
     impl Registry {
@@ -515,9 +523,16 @@ mod tests {
             if accessible.get_role().await? != Role::Application {
                 return Err(fdo::Error::Failed("unexpected_application_role".into()));
             }
-            Ok(ObjectRef::new_owned(
+            let desktop = ObjectRef::new_owned(
                 connection.unique_name().unwrap().to_owned(),
                 ObjectId::Root.path(),
+            );
+            if accessible.parent().await? != desktop {
+                return Err(fdo::Error::Failed("unexpected_application_parent".into()));
+            }
+            Ok(ObjectRef::new_owned(
+                connection.unique_name().unwrap().to_owned(),
+                ObjectPath::from_static_str_unchecked(DESKTOP_PATH),
             ))
         }
     }
@@ -549,34 +564,21 @@ mod tests {
                         .build()
                         .await
                         .unwrap();
-                    let conn = Builder::address(address.trim())
-                        .unwrap()
-                        .internal_executor(false)
-                        .build()
+                    let bus = Bus::connect(address.trim().try_into().unwrap(), &executor)
                         .await
                         .unwrap();
-                    let conn_copy = conn.clone();
-                    let task = executor.spawn(
-                        async move {
-                            loop {
-                                conn_copy.executor().tick().await;
-                            }
-                        },
-                        "test_atspi_bus",
-                    );
-                    let socket_proxy = SocketProxy::new(&conn).await.unwrap();
-                    let mut bus = Bus {
-                        conn,
-                        _task: task,
-                        socket_proxy,
-                        desktop: Arc::new(OnceLock::new()),
-                    };
-                    bus.register_root_node().await.unwrap();
 
                     let desktop = ObjectRef::new_owned(
                         registry.unique_name().unwrap().to_owned(),
-                        ObjectId::Root.path(),
+                        ObjectPath::from_static_str_unchecked(DESKTOP_PATH),
                     );
+                    let accessible = AccessibleProxy::builder(&registry)
+                        .destination(bus.unique_name().as_str())
+                        .unwrap()
+                        .build()
+                        .await
+                        .unwrap();
+                    assert_eq!(accessible.parent().await.unwrap(), desktop);
                     let cache = CacheProxy::builder(&registry)
                         .destination(bus.unique_name().as_str())
                         .unwrap()
