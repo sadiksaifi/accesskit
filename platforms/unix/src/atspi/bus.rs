@@ -506,6 +506,23 @@ mod tests {
 
     struct PrivateBus(Child);
 
+    impl PrivateBus {
+        fn new() -> (Self, String) {
+            let child = Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut daemon = Self(child);
+            let mut address = String::new();
+            BufReader::new(daemon.0.stdout.take().unwrap())
+                .read_line(&mut address)
+                .unwrap();
+            (daemon, address)
+        }
+    }
+
     impl Drop for PrivateBus {
         fn drop(&mut self) {
             let _ = self.0.kill();
@@ -548,17 +565,7 @@ mod tests {
 
     #[test]
     fn application_root_is_queryable_during_registry_embedding() {
-        let child = Command::new("dbus-daemon")
-            .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut daemon = PrivateBus(child);
-        let mut address = String::new();
-        BufReader::new(daemon.0.stdout.take().unwrap())
-            .read_line(&mut address)
-            .unwrap();
+        let (_daemon, address) = PrivateBus::new();
 
         block_on(async {
             let executor = Executor::new();
@@ -596,6 +603,104 @@ mod tests {
                         .unwrap();
                     let items = cache.get_items().await.unwrap();
                     assert_eq!(items[0].parent, desktop);
+                })
+                .await;
+        });
+    }
+
+    #[cfg(not(feature = "tokio"))]
+    #[test]
+    fn first_call_queued_during_connection_setup_receives_a_reply() {
+        use futures_lite::{StreamExt, future::poll_once};
+        use std::{
+            sync::mpsc,
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let (_daemon, address) = PrivateBus::new();
+        block_on(async {
+            let registry = Builder::address(address.trim())
+                .unwrap()
+                .name("org.a11y.atspi.Registry")
+                .unwrap()
+                .serve_at(ObjectId::Root.path(), Registry)
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let client = registry.clone();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (sent_tx, sent_rx) = mpsc::channel();
+            let probe = thread::spawn(move || {
+                block_on(async {
+                    let dbus = zbus::fdo::DBusProxy::new(&client).await.unwrap();
+                    let mut names = dbus.receive_name_owner_changed().await.unwrap();
+                    let mut replies = zbus::MessageStream::from(&client);
+                    ready_tx.send(()).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let target = loop {
+                        if let Some(Some(signal)) = poll_once(names.next()).await {
+                            let args = signal.args().unwrap();
+                            if let BusName::Unique(name) = args.name() {
+                                if args.new_owner().is_some() {
+                                    break name.to_owned();
+                                }
+                            }
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "application_connection_not_observed"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    };
+                    let call = zbus::Message::method_call(ObjectId::Root.path(), "Ping")
+                        .unwrap()
+                        .destination(target)
+                        .unwrap()
+                        .interface("org.freedesktop.DBus.Peer")
+                        .unwrap()
+                        .build(&())
+                        .unwrap();
+                    client.send(&call).await.unwrap();
+                    sent_tx.send(()).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        if let Some(Some(reply)) = poll_once(replies.next()).await {
+                            let reply = reply.unwrap();
+                            if reply.header().reply_serial()
+                                == Some(call.primary_header().serial_num())
+                            {
+                                return reply.message_type() == zbus::message::Type::MethodReturn;
+                            }
+                        }
+                        if Instant::now() >= deadline {
+                            return false;
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                })
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            let executor = Executor::new();
+            let mut connecting =
+                Box::pin(Bus::connect(address.trim().try_into().unwrap(), &executor));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            // Queue the first client call before driving the connection's worker.
+            // A lazy dispatcher loses it when the already-queued reader runs first.
+            while sent_rx.try_recv().is_err() {
+                assert!(poll_once(connecting.as_mut()).await.is_none());
+                assert!(Instant::now() < deadline, "early_call_not_sent");
+                thread::sleep(Duration::from_millis(1));
+            }
+            executor
+                .run(async {
+                    let _bus = connecting.await.unwrap();
+                    while !probe.is_finished() {
+                        futures_lite::future::yield_now().await;
+                    }
+                    assert!(probe.join().unwrap(), "first_call_received_no_reply");
                 })
                 .await;
         });
