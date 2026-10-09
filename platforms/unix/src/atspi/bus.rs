@@ -82,12 +82,8 @@ impl Bus {
             .at(path.clone(), ApplicationInterface(node.clone()))
             .await?
         {
-            let desktop = self
-                .socket_proxy
-                .embed(&(self.unique_name().as_str(), ObjectId::Root.path().into()))
-                .await?;
-            let _ = self.desktop.set(desktop);
-
+            // Embed announces the application to clients before its reply arrives.
+            // Serve root queries before that announcement can trigger them.
             self.conn
                 .object_server()
                 .at(
@@ -99,6 +95,12 @@ impl Bus {
                     ),
                 )
                 .await?;
+
+            let desktop = self
+                .socket_proxy
+                .embed(&(self.unique_name().as_str(), ObjectId::Root.path().into()))
+                .await?;
+            let _ = self.desktop.set(desktop);
 
             self.conn
                 .object_server()
@@ -471,5 +473,120 @@ where
         Ok(result) => Ok(f(result)),
         Err(error) if zbus_error_is_unrecoverable(&error) => Err(error),
         Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atspi::{ObjectRef, Role, proxy::accessible::AccessibleProxy, proxy::cache::CacheProxy};
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Child, Command, Stdio},
+    };
+    use zbus::{fdo, interface, zvariant::ObjectPath};
+
+    use crate::util::block_on;
+
+    struct PrivateBus(Child);
+
+    impl Drop for PrivateBus {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    struct Registry;
+
+    #[interface(name = "org.a11y.atspi.Socket")]
+    impl Registry {
+        async fn embed(
+            &self,
+            plug: (&str, ObjectPath<'_>),
+            #[zbus(connection)] connection: &Connection,
+        ) -> fdo::Result<ObjectRefOwned> {
+            // The registry can expose the application to clients before Embed returns.
+            let accessible = AccessibleProxy::builder(connection)
+                .destination(plug.0)?
+                .path(plug.1)?
+                .build()
+                .await?;
+            if accessible.get_role().await? != Role::Application {
+                return Err(fdo::Error::Failed("unexpected_application_role".into()));
+            }
+            Ok(ObjectRef::new_owned(
+                connection.unique_name().unwrap().to_owned(),
+                ObjectId::Root.path(),
+            ))
+        }
+    }
+
+    #[test]
+    fn application_root_is_queryable_during_registry_embedding() {
+        let child = Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut daemon = PrivateBus(child);
+        let mut address = String::new();
+        BufReader::new(daemon.0.stdout.take().unwrap())
+            .read_line(&mut address)
+            .unwrap();
+
+        block_on(async {
+            let executor = Executor::new();
+            executor
+                .run(async {
+                    let registry = Builder::address(address.trim())
+                        .unwrap()
+                        .name("org.a11y.atspi.Registry")
+                        .unwrap()
+                        .serve_at(ObjectId::Root.path(), Registry)
+                        .unwrap()
+                        .build()
+                        .await
+                        .unwrap();
+                    let conn = Builder::address(address.trim())
+                        .unwrap()
+                        .internal_executor(false)
+                        .build()
+                        .await
+                        .unwrap();
+                    let conn_copy = conn.clone();
+                    let task = executor.spawn(
+                        async move {
+                            loop {
+                                conn_copy.executor().tick().await;
+                            }
+                        },
+                        "test_atspi_bus",
+                    );
+                    let socket_proxy = SocketProxy::new(&conn).await.unwrap();
+                    let mut bus = Bus {
+                        conn,
+                        _task: task,
+                        socket_proxy,
+                        desktop: Arc::new(OnceLock::new()),
+                    };
+                    bus.register_root_node().await.unwrap();
+
+                    let desktop = ObjectRef::new_owned(
+                        registry.unique_name().unwrap().to_owned(),
+                        ObjectId::Root.path(),
+                    );
+                    let cache = CacheProxy::builder(&registry)
+                        .destination(bus.unique_name().as_str())
+                        .unwrap()
+                        .build()
+                        .await
+                        .unwrap();
+                    let items = cache.get_items().await.unwrap();
+                    assert_eq!(items[0].parent, desktop);
+                })
+                .await;
+        });
     }
 }

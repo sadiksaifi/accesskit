@@ -2,8 +2,8 @@
 
 SpaceTerm uses this AccessKit fork to preserve Terminal caret geometry, complete word boundaries,
 bounded AT-SPI text events, and efficient sparse text updates, and to attach host-owned macOS
-accessibility elements to AccessKit nodes. Cargo pins the core, consumer, AT-SPI translation, and
-macOS adapter crates to an immutable `spaceterm-YYYY-MM-DD` tag at
+accessibility elements to AccessKit nodes. Cargo pins the core, consumer, AT-SPI translation, Unix
+adapter, and macOS adapter crates to an immutable `spaceterm-YYYY-MM-DD` tag at
 `https://github.com/sadiksaifi/accesskit`. Another release on the same date adds `.1`, `.2`, and so on.
 Never move or delete a published tag.
 
@@ -29,6 +29,7 @@ dependency for the core's serialization regressions.
 - `fix(macos): publish headings with the AXHeading role`
 - `feat(macos): show context menus through AXShowMenu`
 - `feat(macos): publish the contents on each side of a splitter`
+- `fix(atspi): publish the application root before registry embedding`
 
 The context menu patch implements `accessibilityPerformShowMenu` and allows the selector only
 when the node supports `Action::ShowContextMenu` under the adapter's filter. AppKit discovers
@@ -61,16 +62,16 @@ before the final source comparison. Every retained patch test is included.
 2. Run the validation below, then commit source and documentation changes with Conventional Commits.
 3. Create an annotated tag with `git tag -a <tag> -m 'SpaceTerm AccessKit <tag>'`, using the date
    scheme above. Push the fork branch and new tag to `sadiksaifi/accesskit`.
-4. In SpaceTerm, disable any local AccessKit override and update all four `[patch.crates-io]`
+4. In SpaceTerm, disable any local AccessKit override and update all five `[patch.crates-io]`
    entries to the published tag. Refresh the lockfile with
-   `mise exec -- cargo update -p accesskit -p accesskit_consumer -p accesskit_atspi_common -p accesskit_macos`.
-5. Run `mise run check`, `mise run lint:rust`, `mise run fmt`, `mise run test:one accesskit`, and
-   `mise run test:one accessibility`. Commit the manifest and lockfile together.
+   `mise exec -- cargo update -p accesskit -p accesskit_consumer -p accesskit_atspi_common -p accesskit_macos -p accesskit_unix`.
+5. Run `mise run check`, `mise run lint:rust`, `mise run fmt`, `mise run test accesskit`, and
+   `mise run test accessibility`. Commit the manifest and lockfile together.
 
 ## Local development
 
 In SpaceTerm, `mise run accesskit:local /path/to/accesskit` adds an owned `[patch.crates-io]`
-block to `.cargo/config.toml`, overriding the pinned Git sources for all four crates without
+block to `.cargo/config.toml`, overriding the pinned Git sources for all five crates without
 fetching the fork. `mise run accesskit:pinned` removes only that block and resolves the published
 tag again. Keep the local configuration addition and any local lockfile changes uncommitted.
 SpaceTerm's existing environment and local GPUI configuration are preserved.
@@ -83,6 +84,8 @@ macOS only; its `native_children` test opens an AppKit window on the main thread
 ```sh
 export CARGO_TARGET_DIR=/home/sdk/.worktrees/accesskit-target
 mise exec rust@1.98.1 -- cargo test -p accesskit -p accesskit_consumer -p accesskit_atspi_common
+mise exec rust@1.98.1 -- cargo test -p accesskit_unix
+mise exec rust@1.98.1 -- cargo test -p accesskit_unix --no-default-features --features tokio
 mise exec rust@1.98.1 -- cargo test -p accesskit -p accesskit_consumer -p accesskit_atspi_common --features accesskit/serde,accesskit/schemars
 mise exec rust@1.98.1 -- cargo clippy -p accesskit -p accesskit_consumer -p accesskit_atspi_common --all-targets -- -D warnings
 mise exec rust@1.98.1 -- cargo clippy -p accesskit -p accesskit_consumer -p accesskit_atspi_common --all-targets --features accesskit/serde,accesskit/schemars,accesskit/enumn,accesskit_atspi_common/simplified-api -- -D warnings
