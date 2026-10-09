@@ -83,10 +83,19 @@ impl Bus {
     async fn register_root_node(&mut self) -> Result<()> {
         let node = PlatformRoot::new(get_or_init_app_context());
         let path = ObjectId::Root.path();
-        let registry = zbus::fdo::DBusProxy::new(&self.conn)
-            .await?
-            .get_name_owner(self.socket_proxy.inner().destination().to_owned())
-            .await?;
+        let dbus = zbus::fdo::DBusProxy::new(&self.conn).await?;
+        let destination = self.socket_proxy.inner().destination();
+        // Embed normally activates the registry. Resolve its desktop without
+        // requiring it to have been running before this connection started.
+        let registry = match dbus.get_name_owner(destination.to_owned()).await {
+            Err(zbus::fdo::Error::NameHasNoOwner(_)) => {
+                if let BusName::WellKnown(name) = destination {
+                    dbus.start_service_by_name(name.clone(), 0).await?;
+                }
+                dbus.get_name_owner(destination.to_owned()).await?
+            }
+            result => result?,
+        };
 
         if self
             .conn
