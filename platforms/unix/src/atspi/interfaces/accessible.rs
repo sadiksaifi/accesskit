@@ -147,6 +147,7 @@ pub(crate) struct RootAccessibleInterface {
     bus_name: OwnedUniqueName,
     root: PlatformRoot,
     desktop: Arc<OnceLock<ObjectRefOwned>>,
+    registry_root: OwnedObjectAddress,
 }
 
 impl RootAccessibleInterface {
@@ -154,11 +155,13 @@ impl RootAccessibleInterface {
         bus_name: OwnedUniqueName,
         root: PlatformRoot,
         desktop: Arc<OnceLock<ObjectRefOwned>>,
+        registry_root: OwnedObjectAddress,
     ) -> Self {
         Self {
             bus_name,
             root,
             desktop,
+            registry_root,
         }
     }
 }
@@ -180,9 +183,8 @@ impl RootAccessibleInterface {
         self.desktop
             .get()
             .cloned()
-            .unwrap_or_default()
-            .into_inner()
-            .into()
+            .map(|desktop| desktop.into_inner().into())
+            .unwrap_or_else(|| self.registry_root.clone())
     }
 
     #[zbus(property)]

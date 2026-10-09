@@ -44,8 +44,16 @@ impl Bus {
             _ => BusProxy::new(session_bus).await?.get_address().await?,
         };
         let address: Address = address.as_str().try_into()?;
+        Self::connect(address, executor).await
+    }
+
+    async fn connect(address: Address, executor: &Executor<'_>) -> zbus::Result<Self> {
+        let node = PlatformRoot::new(get_or_init_app_context());
         let conn = Builder::address(address)?
             .internal_executor(false)
+            // Builder waits for the method dispatcher to listen. Starting it
+            // lazily can lose the first query triggered by registry embedding.
+            .serve_at(ObjectId::Root.path(), ApplicationInterface(node))?
             .build()
             .await?;
         let conn_copy = conn.clone();
@@ -75,30 +83,40 @@ impl Bus {
     async fn register_root_node(&mut self) -> Result<()> {
         let node = PlatformRoot::new(get_or_init_app_context());
         let path = ObjectId::Root.path();
+        let dbus = zbus::fdo::DBusProxy::new(&self.conn).await?;
+        let destination = self.socket_proxy.inner().destination();
+        // Embed normally activates the registry. Resolve its desktop without
+        // requiring it to have been running before this connection started.
+        let registry = match dbus.get_name_owner(destination.to_owned()).await {
+            Err(zbus::fdo::Error::NameHasNoOwner(_)) => {
+                if let BusName::WellKnown(name) = destination {
+                    dbus.start_service_by_name(name.clone(), 0).await?;
+                }
+                dbus.get_name_owner(destination.to_owned()).await?
+            }
+            result => result?,
+        };
 
         if self
             .conn
             .object_server()
-            .at(path.clone(), ApplicationInterface(node.clone()))
+            .at(
+                path,
+                RootAccessibleInterface::new(
+                    self.unique_name().to_owned(),
+                    node.clone(),
+                    Arc::clone(&self.desktop),
+                    ObjectId::Root.to_address(registry.inner()),
+                ),
+            )
             .await?
         {
+            // Embed announces the application before its reply arrives.
             let desktop = self
                 .socket_proxy
                 .embed(&(self.unique_name().as_str(), ObjectId::Root.path().into()))
                 .await?;
             let _ = self.desktop.set(desktop);
-
-            self.conn
-                .object_server()
-                .at(
-                    path,
-                    RootAccessibleInterface::new(
-                        self.unique_name().to_owned(),
-                        node.clone(),
-                        Arc::clone(&self.desktop),
-                    ),
-                )
-                .await?;
 
             self.conn
                 .object_server()
@@ -471,5 +489,220 @@ where
         Ok(result) => Ok(f(result)),
         Err(error) if zbus_error_is_unrecoverable(&error) => Err(error),
         Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atspi::{ObjectRef, Role, proxy::accessible::AccessibleProxy, proxy::cache::CacheProxy};
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Child, Command, Stdio},
+    };
+    use zbus::{fdo, interface, zvariant::ObjectPath};
+
+    use crate::util::block_on;
+
+    struct PrivateBus(Child);
+
+    impl PrivateBus {
+        fn new() -> (Self, String) {
+            let child = Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut daemon = Self(child);
+            let mut address = String::new();
+            BufReader::new(daemon.0.stdout.take().unwrap())
+                .read_line(&mut address)
+                .unwrap();
+            (daemon, address)
+        }
+    }
+
+    impl Drop for PrivateBus {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    struct Registry;
+    const DESKTOP_PATH: &str = "/org/a11y/atspi/accessible/desktop";
+
+    #[interface(name = "org.a11y.atspi.Socket")]
+    impl Registry {
+        async fn embed(
+            &self,
+            plug: (&str, ObjectPath<'_>),
+            #[zbus(connection)] connection: &Connection,
+        ) -> fdo::Result<ObjectRefOwned> {
+            // The registry can expose the application to clients before Embed returns.
+            let accessible = AccessibleProxy::builder(connection)
+                .destination(plug.0)?
+                .path(plug.1)?
+                .build()
+                .await?;
+            if accessible.get_role().await? != Role::Application {
+                return Err(fdo::Error::Failed("unexpected_application_role".into()));
+            }
+            let desktop = ObjectRef::new_owned(
+                connection.unique_name().unwrap().to_owned(),
+                ObjectId::Root.path(),
+            );
+            if accessible.parent().await? != desktop {
+                return Err(fdo::Error::Failed("unexpected_application_parent".into()));
+            }
+            Ok(ObjectRef::new_owned(
+                connection.unique_name().unwrap().to_owned(),
+                ObjectPath::from_static_str_unchecked(DESKTOP_PATH),
+            ))
+        }
+    }
+
+    #[test]
+    fn application_root_is_queryable_during_registry_embedding() {
+        let (_daemon, address) = PrivateBus::new();
+
+        block_on(async {
+            let executor = Executor::new();
+            executor
+                .run(async {
+                    let registry = Builder::address(address.trim())
+                        .unwrap()
+                        .name("org.a11y.atspi.Registry")
+                        .unwrap()
+                        .serve_at(ObjectId::Root.path(), Registry)
+                        .unwrap()
+                        .build()
+                        .await
+                        .unwrap();
+                    let bus = Bus::connect(address.trim().try_into().unwrap(), &executor)
+                        .await
+                        .unwrap();
+
+                    let desktop = ObjectRef::new_owned(
+                        registry.unique_name().unwrap().to_owned(),
+                        ObjectPath::from_static_str_unchecked(DESKTOP_PATH),
+                    );
+                    let accessible = AccessibleProxy::builder(&registry)
+                        .destination(bus.unique_name().as_str())
+                        .unwrap()
+                        .build()
+                        .await
+                        .unwrap();
+                    assert_eq!(accessible.parent().await.unwrap(), desktop);
+                    let cache = CacheProxy::builder(&registry)
+                        .destination(bus.unique_name().as_str())
+                        .unwrap()
+                        .build()
+                        .await
+                        .unwrap();
+                    let items = cache.get_items().await.unwrap();
+                    assert_eq!(items[0].parent, desktop);
+                })
+                .await;
+        });
+    }
+
+    #[cfg(not(feature = "tokio"))]
+    #[test]
+    fn first_call_queued_during_connection_setup_receives_a_reply() {
+        use futures_lite::{StreamExt, future::poll_once};
+        use std::{
+            sync::mpsc,
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let (_daemon, address) = PrivateBus::new();
+        block_on(async {
+            let registry = Builder::address(address.trim())
+                .unwrap()
+                .name("org.a11y.atspi.Registry")
+                .unwrap()
+                .serve_at(ObjectId::Root.path(), Registry)
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let client = registry.clone();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (sent_tx, sent_rx) = mpsc::channel();
+            let probe = thread::spawn(move || {
+                block_on(async {
+                    let dbus = zbus::fdo::DBusProxy::new(&client).await.unwrap();
+                    let mut names = dbus.receive_name_owner_changed().await.unwrap();
+                    let mut replies = zbus::MessageStream::from(&client);
+                    ready_tx.send(()).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let target = loop {
+                        if let Some(Some(signal)) = poll_once(names.next()).await {
+                            let args = signal.args().unwrap();
+                            if let BusName::Unique(name) = args.name() {
+                                if args.new_owner().is_some() {
+                                    break name.to_owned();
+                                }
+                            }
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "application_connection_not_observed"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    };
+                    let call = zbus::Message::method_call(ObjectId::Root.path(), "Ping")
+                        .unwrap()
+                        .destination(target)
+                        .unwrap()
+                        .interface("org.freedesktop.DBus.Peer")
+                        .unwrap()
+                        .build(&())
+                        .unwrap();
+                    client.send(&call).await.unwrap();
+                    sent_tx.send(()).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        if let Some(Some(reply)) = poll_once(replies.next()).await {
+                            let reply = reply.unwrap();
+                            if reply.header().reply_serial()
+                                == Some(call.primary_header().serial_num())
+                            {
+                                return reply.message_type() == zbus::message::Type::MethodReturn;
+                            }
+                        }
+                        if Instant::now() >= deadline {
+                            return false;
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                })
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            let executor = Executor::new();
+            let mut connecting =
+                Box::pin(Bus::connect(address.trim().try_into().unwrap(), &executor));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            // Queue the first client call before driving the connection's worker.
+            // A lazy dispatcher loses it when the already-queued reader runs first.
+            while sent_rx.try_recv().is_err() {
+                assert!(poll_once(connecting.as_mut()).await.is_none());
+                assert!(Instant::now() < deadline, "early_call_not_sent");
+                thread::sleep(Duration::from_millis(1));
+            }
+            executor
+                .run(async {
+                    let _bus = connecting.await.unwrap();
+                    while !probe.is_finished() {
+                        futures_lite::future::yield_now().await;
+                    }
+                    assert!(probe.join().unwrap(), "first_call_received_no_reply");
+                })
+                .await;
+        });
     }
 }
