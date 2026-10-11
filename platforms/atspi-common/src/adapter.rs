@@ -34,6 +34,7 @@ struct AdapterChangeHandler<'a> {
     checked_text_change: HashSet<NodeId>,
     checked_text_selection_change: HashSet<NodeId>,
     selection_changed: HashSet<NodeId>,
+    added_navigation_containers: HashSet<NodeId>,
 }
 
 impl<'a> AdapterChangeHandler<'a> {
@@ -45,6 +46,7 @@ impl<'a> AdapterChangeHandler<'a> {
             checked_text_change: HashSet::new(),
             checked_text_selection_change: HashSet::new(),
             selection_changed: HashSet::new(),
+            added_navigation_containers: HashSet::new(),
         }
     }
 
@@ -56,6 +58,9 @@ impl<'a> AdapterChangeHandler<'a> {
         self.added_nodes.insert(id);
 
         let role = node.role();
+        if matches!(role, Role::TabList | Role::Tree | Role::TreeGrid) {
+            self.added_navigation_containers.insert(id);
+        }
         let is_root = node.is_root();
         let wrapper = NodeWrapper(node);
         let interfaces = wrapper.interfaces();
@@ -250,10 +255,11 @@ impl<'a> AdapterChangeHandler<'a> {
 
     fn emit_selection_changed(&mut self) {
         for id in self.selection_changed.iter() {
-            // A container added in this update has an initial selection, not a changed one.
-            // Announcing it would let a screen reader move its focus to the selected item after
-            // the application has focused something else.
-            if self.removed_nodes.contains(id) || self.added_nodes.contains(id) {
+            // A tab list or tree added in this update shows its current location, so its selection
+            // is initial state, not a change. Orca moves its focus to a changed selection, which
+            // would take it from whatever the application focused. Menus and list boxes still
+            // announce their initial selection, because they open for the person to choose from.
+            if self.removed_nodes.contains(id) || self.added_navigation_containers.contains(id) {
                 continue;
             }
             self.adapter
@@ -687,8 +693,8 @@ mod tests {
         }
     }
 
-    fn tab(selected: bool) -> Node {
-        let mut node = Node::new(Role::Tab);
+    fn item(role: Role, selected: bool) -> Node {
+        let mut node = Node::new(role);
         node.set_selected(selected);
         node
     }
@@ -702,61 +708,105 @@ mod tests {
             .collect()
     }
 
-    fn tab_list_tree(first_selected: bool) -> TreeUpdate {
+    /// The selection container is the window's only child, so its consumer ID is read from the
+    /// tree instead of constructed.
+    fn container_id(adapter: &Adapter) -> NodeId {
+        let tree = adapter.context.read_tree();
+        tree.state().root().children().next().unwrap().id()
+    }
+
+    fn container_tree(container: Role, items: &[(Role, bool)]) -> TreeUpdate {
+        let ids = (2..2 + items.len() as u64)
+            .map(LocalNodeId)
+            .collect::<Vec<_>>();
+        let mut nodes = vec![
+            (
+                LocalNodeId(0),
+                with_children(Role::Window, &[LocalNodeId(1)]),
+            ),
+            (LocalNodeId(1), with_children(container, &ids)),
+        ];
+        nodes.extend(
+            ids.iter()
+                .zip(items)
+                .map(|(id, (role, selected))| (*id, item(*role, *selected))),
+        );
         TreeUpdate {
-            nodes: vec![
-                (
-                    LocalNodeId(0),
-                    with_children(Role::Window, &[LocalNodeId(1)]),
-                ),
-                (
-                    LocalNodeId(1),
-                    with_children(Role::TabList, &[LocalNodeId(2), LocalNodeId(3)]),
-                ),
-                (LocalNodeId(2), tab(first_selected)),
-                (LocalNodeId(3), tab(!first_selected)),
-            ],
+            nodes,
             tree: Some(Tree::new(LocalNodeId(0))),
             tree_id: TreeId::ROOT,
             focus: LocalNodeId(0),
         }
     }
 
-    #[test]
-    fn a_container_added_with_a_selected_item_emits_no_selection_change() {
-        let (mut adapter, ops) = build(initial_tree());
+    /// Adds a container with one selected and one unselected item to a window that lacked it.
+    fn add_container(container: Role, item_role: Role) -> (Vec<NodeId>, NodeId) {
+        let (mut adapter, ops) = build(TreeUpdate {
+            nodes: vec![(LocalNodeId(0), Node::new(Role::Window))],
+            tree: Some(Tree::new(LocalNodeId(0))),
+            tree_id: TreeId::ROOT,
+            focus: LocalNodeId(0),
+        });
         adapter.update(update(vec![
             (
                 LocalNodeId(0),
-                with_children(Role::Window, &[LocalNodeId(1), LocalNodeId(2)]),
+                with_children(Role::Window, &[LocalNodeId(1)]),
             ),
             (
-                LocalNodeId(2),
-                with_children(Role::TabList, &[LocalNodeId(3), LocalNodeId(4)]),
+                LocalNodeId(1),
+                with_children(container, &[LocalNodeId(2), LocalNodeId(3)]),
             ),
-            (LocalNodeId(3), tab(true)),
-            (LocalNodeId(4), tab(false)),
+            (LocalNodeId(2), item(item_role, true)),
+            (LocalNodeId(3), item(item_role, false)),
         ]));
         let changes = selection_changes(&ops.lock().unwrap());
-        assert_eq!(changes, vec![]);
+        (changes, container_id(&adapter))
     }
 
     #[test]
-    fn selecting_another_item_in_an_existing_container_emits_one_selection_change() {
-        let (mut adapter, ops) = build(tab_list_tree(true));
-        adapter.update(update(vec![
-            (LocalNodeId(2), tab(false)),
-            (LocalNodeId(3), tab(true)),
-        ]));
-        let changes = selection_changes(&ops.lock().unwrap());
-        assert_eq!(changes.len(), 1);
+    fn an_added_tab_list_or_tree_emits_no_selection_change_for_its_initial_selection() {
+        for (container, item_role) in [
+            (Role::TabList, Role::Tab),
+            (Role::Tree, Role::TreeItem),
+            (Role::TreeGrid, Role::Row),
+        ] {
+            let (changes, _) = add_container(container, item_role);
+            assert_eq!(changes, vec![], "{container:?}");
+        }
     }
 
     #[test]
-    fn adding_a_selected_item_to_an_existing_container_emits_one_selection_change() {
-        let (mut adapter, ops) = build(tab_list_tree(true));
+    fn an_added_menu_or_list_box_announces_its_initial_selection() {
+        for (container, item_role) in [
+            (Role::Menu, Role::MenuItem),
+            (Role::ListBox, Role::ListBoxOption),
+        ] {
+            let (changes, container) = add_container(container, item_role);
+            assert_eq!(changes, vec![container], "{item_role:?}");
+        }
+    }
+
+    #[test]
+    fn selecting_another_item_in_an_existing_tab_list_emits_one_selection_change() {
+        let (mut adapter, ops) = build(container_tree(
+            Role::TabList,
+            &[(Role::Tab, true), (Role::Tab, false)],
+        ));
         adapter.update(update(vec![
-            (LocalNodeId(2), tab(false)),
+            (LocalNodeId(2), item(Role::Tab, false)),
+            (LocalNodeId(3), item(Role::Tab, true)),
+        ]));
+        let changes = selection_changes(&ops.lock().unwrap());
+        assert_eq!(changes, vec![container_id(&adapter)]);
+    }
+
+    #[test]
+    fn adding_a_selected_item_to_an_existing_tab_list_emits_one_selection_change() {
+        let (mut adapter, ops) = build(container_tree(
+            Role::TabList,
+            &[(Role::Tab, false), (Role::Tab, false)],
+        ));
+        adapter.update(update(vec![
             (
                 LocalNodeId(1),
                 with_children(
@@ -764,10 +814,10 @@ mod tests {
                     &[LocalNodeId(2), LocalNodeId(3), LocalNodeId(4)],
                 ),
             ),
-            (LocalNodeId(4), tab(true)),
+            (LocalNodeId(4), item(Role::Tab, true)),
         ]));
         let changes = selection_changes(&ops.lock().unwrap());
-        assert_eq!(changes.len(), 1);
+        assert_eq!(changes, vec![container_id(&adapter)]);
     }
 
     #[test]
