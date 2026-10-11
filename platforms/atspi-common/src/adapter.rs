@@ -765,11 +765,7 @@ mod tests {
 
     #[test]
     fn an_added_tab_list_or_tree_emits_no_selection_change_for_its_initial_selection() {
-        for (container, item_role) in [
-            (Role::TabList, Role::Tab),
-            (Role::Tree, Role::TreeItem),
-            (Role::TreeGrid, Role::Row),
-        ] {
+        for (container, item_role) in NAVIGATION_CONTAINERS {
             let (changes, _) = add_container(container, item_role);
             assert_eq!(changes, vec![], "{container:?}");
         }
@@ -786,38 +782,46 @@ mod tests {
         }
     }
 
+    /// The suppressed containers, each with an item role that reports selection changes.
+    const NAVIGATION_CONTAINERS: [(Role, Role); 3] = [
+        (Role::TabList, Role::Tab),
+        (Role::Tree, Role::TreeItem),
+        (Role::TreeGrid, Role::TreeItem),
+    ];
+
     #[test]
-    fn selecting_another_item_in_an_existing_tab_list_emits_one_selection_change() {
-        let (mut adapter, ops) = build(container_tree(
-            Role::TabList,
-            &[(Role::Tab, true), (Role::Tab, false)],
-        ));
-        adapter.update(update(vec![
-            (LocalNodeId(2), item(Role::Tab, false)),
-            (LocalNodeId(3), item(Role::Tab, true)),
-        ]));
-        let changes = selection_changes(&ops.lock().unwrap());
-        assert_eq!(changes, vec![container_id(&adapter)]);
+    fn selecting_another_item_in_an_existing_tab_list_or_tree_emits_one_selection_change() {
+        for (container, item_role) in NAVIGATION_CONTAINERS {
+            let (mut adapter, ops) = build(container_tree(
+                container,
+                &[(item_role, true), (item_role, false)],
+            ));
+            adapter.update(update(vec![
+                (LocalNodeId(2), item(item_role, false)),
+                (LocalNodeId(3), item(item_role, true)),
+            ]));
+            let changes = selection_changes(&ops.lock().unwrap());
+            assert_eq!(changes, vec![container_id(&adapter)], "{container:?}");
+        }
     }
 
     #[test]
-    fn adding_a_selected_item_to_an_existing_tab_list_emits_one_selection_change() {
-        let (mut adapter, ops) = build(container_tree(
-            Role::TabList,
-            &[(Role::Tab, false), (Role::Tab, false)],
-        ));
-        adapter.update(update(vec![
-            (
-                LocalNodeId(1),
-                with_children(
-                    Role::TabList,
-                    &[LocalNodeId(2), LocalNodeId(3), LocalNodeId(4)],
+    fn adding_a_selected_item_to_an_existing_tab_list_or_tree_emits_one_selection_change() {
+        for (container, item_role) in NAVIGATION_CONTAINERS {
+            let (mut adapter, ops) = build(container_tree(
+                container,
+                &[(item_role, false), (item_role, false)],
+            ));
+            adapter.update(update(vec![
+                (
+                    LocalNodeId(1),
+                    with_children(container, &[LocalNodeId(2), LocalNodeId(3), LocalNodeId(4)]),
                 ),
-            ),
-            (LocalNodeId(4), item(Role::Tab, true)),
-        ]));
-        let changes = selection_changes(&ops.lock().unwrap());
-        assert_eq!(changes, vec![container_id(&adapter)]);
+                (LocalNodeId(4), item(item_role, true)),
+            ]));
+            let changes = selection_changes(&ops.lock().unwrap());
+            assert_eq!(changes, vec![container_id(&adapter)], "{container:?}");
+        }
     }
 
     #[test]
