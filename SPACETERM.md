@@ -31,6 +31,7 @@ dependency for the core's serialization regressions.
 - `feat(macos): publish the contents on each side of a splitter`
 - `fix(atspi): publish the application root before registry embedding`
 - `fix(atspi): start the method dispatcher before registry embedding`
+- `fix(atspi): treat a new container's selection as initial, not changed`
 
 The context menu patch implements `accessibilityPerformShowMenu` and allows the selector only
 when the node supports `Action::ShowContextMenu` under the adapter's filter. AppKit discovers
@@ -51,6 +52,13 @@ The heading patch changes `Role::Heading` from `Heading` to `AXHeading` so Voice
 recognize headings. `Role::DocSubtitle` already maps to `AXHeading` in the role table and
 remains unchanged. The `heading_roles` integration test checks both roles through the macOS
 accessibility interface on the main thread.
+
+The initial selection patch stops `object:selection-changed` for a selection container added in
+the same update. Orca handles a selection change by moving its focus to the selected item. When
+SpaceTerm published its tab list and Workspace tree at window creation, Orca could process that
+event after the Terminal's focus event, leave the Terminal, and drop its text events. A selection
+change in an existing container, including a selected item added to it, still emits the event.
+The adapter's selection tests cover all three cases.
 
 The `alloc::vec` patch adds an import required by the shared-children test when the core
 builds without its optional standard-library features. It was also applied to the retained copy

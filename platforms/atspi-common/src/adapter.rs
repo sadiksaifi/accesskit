@@ -250,7 +250,10 @@ impl<'a> AdapterChangeHandler<'a> {
 
     fn emit_selection_changed(&mut self) {
         for id in self.selection_changed.iter() {
-            if self.removed_nodes.contains(id) {
+            // A container added in this update has an initial selection, not a changed one.
+            // Announcing it would let a screen reader move its focus to the selected item after
+            // the application has focused something else.
+            if self.removed_nodes.contains(id) || self.added_nodes.contains(id) {
                 continue;
             }
             self.adapter
@@ -597,7 +600,10 @@ impl Drop for Adapter {
 #[cfg(test)]
 mod tests {
     use super::Adapter;
-    use crate::{AdapterCallback, AppContext, CacheEvent, Event, InterfaceSet, WindowBounds};
+    use crate::{
+        AdapterCallback, AppContext, CacheEvent, Event, InterfaceSet, NodeIdOrRoot, ObjectEvent,
+        WindowBounds,
+    };
     use accesskit::{
         ActionHandler, ActionRequest, Node, NodeId as LocalNodeId, Role, Tree, TreeId, TreeUpdate,
     };
@@ -608,6 +614,7 @@ mod tests {
     enum CacheOp {
         Added(NodeId),
         Removed(NodeId),
+        SelectionChanged(NodeId),
     }
 
     struct CapturingCallback {
@@ -622,6 +629,10 @@ mod tests {
             match event {
                 Event::Cache(CacheEvent::Added(id)) => ops.push(CacheOp::Added(id)),
                 Event::Cache(CacheEvent::Removed(id)) => ops.push(CacheOp::Removed(id)),
+                Event::Object {
+                    target: NodeIdOrRoot::Node(id),
+                    event: ObjectEvent::SelectionChanged,
+                } => ops.push(CacheOp::SelectionChanged(id)),
                 _ => {}
             }
         }
@@ -674,6 +685,89 @@ mod tests {
             tree_id: TreeId::ROOT,
             focus: LocalNodeId(0),
         }
+    }
+
+    fn tab(selected: bool) -> Node {
+        let mut node = Node::new(Role::Tab);
+        node.set_selected(selected);
+        node
+    }
+
+    fn selection_changes(ops: &[CacheOp]) -> Vec<NodeId> {
+        ops.iter()
+            .filter_map(|op| match op {
+                CacheOp::SelectionChanged(id) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tab_list_tree(first_selected: bool) -> TreeUpdate {
+        TreeUpdate {
+            nodes: vec![
+                (
+                    LocalNodeId(0),
+                    with_children(Role::Window, &[LocalNodeId(1)]),
+                ),
+                (
+                    LocalNodeId(1),
+                    with_children(Role::TabList, &[LocalNodeId(2), LocalNodeId(3)]),
+                ),
+                (LocalNodeId(2), tab(first_selected)),
+                (LocalNodeId(3), tab(!first_selected)),
+            ],
+            tree: Some(Tree::new(LocalNodeId(0))),
+            tree_id: TreeId::ROOT,
+            focus: LocalNodeId(0),
+        }
+    }
+
+    #[test]
+    fn a_container_added_with_a_selected_item_emits_no_selection_change() {
+        let (mut adapter, ops) = build(initial_tree());
+        adapter.update(update(vec![
+            (
+                LocalNodeId(0),
+                with_children(Role::Window, &[LocalNodeId(1), LocalNodeId(2)]),
+            ),
+            (
+                LocalNodeId(2),
+                with_children(Role::TabList, &[LocalNodeId(3), LocalNodeId(4)]),
+            ),
+            (LocalNodeId(3), tab(true)),
+            (LocalNodeId(4), tab(false)),
+        ]));
+        let changes = selection_changes(&ops.lock().unwrap());
+        assert_eq!(changes, vec![]);
+    }
+
+    #[test]
+    fn selecting_another_item_in_an_existing_container_emits_one_selection_change() {
+        let (mut adapter, ops) = build(tab_list_tree(true));
+        adapter.update(update(vec![
+            (LocalNodeId(2), tab(false)),
+            (LocalNodeId(3), tab(true)),
+        ]));
+        let changes = selection_changes(&ops.lock().unwrap());
+        assert_eq!(changes.len(), 1);
+    }
+
+    #[test]
+    fn adding_a_selected_item_to_an_existing_container_emits_one_selection_change() {
+        let (mut adapter, ops) = build(tab_list_tree(true));
+        adapter.update(update(vec![
+            (LocalNodeId(2), tab(false)),
+            (
+                LocalNodeId(1),
+                with_children(
+                    Role::TabList,
+                    &[LocalNodeId(2), LocalNodeId(3), LocalNodeId(4)],
+                ),
+            ),
+            (LocalNodeId(4), tab(true)),
+        ]));
+        let changes = selection_changes(&ops.lock().unwrap());
+        assert_eq!(changes.len(), 1);
     }
 
     #[test]
