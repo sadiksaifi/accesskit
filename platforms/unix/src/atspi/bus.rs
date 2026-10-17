@@ -430,7 +430,7 @@ impl Bus {
 
     async fn emit_cache_signal<B>(&self, signal_name: &str, body: &B) -> Result<()>
     where
-        B: serde::Serialize + zbus::zvariant::DynamicType,
+        B: serde::Serialize + zbus::zvariant::Type,
     {
         map_or_ignoring_recoverable_error(
             self.conn
@@ -439,7 +439,8 @@ impl Bus {
                     cache_path(),
                     InterfaceName::from_str_unchecked("org.a11y.atspi.Cache"),
                     MemberName::from_str_unchecked(signal_name),
-                    body,
+                    // D-Bus expects one structure argument, rather than its fields as arguments.
+                    &(body,),
                 )
                 .await,
             (),
@@ -701,6 +702,98 @@ mod tests {
                         futures_lite::future::yield_now().await;
                     }
                     assert!(probe.join().unwrap(), "first_call_received_no_reply");
+                })
+                .await;
+        });
+    }
+
+    #[test]
+    fn cache_signals_preserve_their_single_structure_argument() {
+        use futures_lite::{StreamExt, future::poll_once};
+        use std::time::{Duration, Instant};
+
+        let (_daemon, address) = PrivateBus::new();
+        block_on(async {
+            let executor = Executor::new();
+            executor
+                .run(async {
+                    let registry = Builder::address(address.trim())
+                        .unwrap()
+                        .name("org.a11y.atspi.Registry")
+                        .unwrap()
+                        .serve_at(ObjectId::Root.path(), Registry)
+                        .unwrap()
+                        .build()
+                        .await
+                        .unwrap();
+                    let bus = Bus::connect(address.trim().try_into().unwrap(), &executor)
+                        .await
+                        .unwrap();
+                    let rule = zbus::MatchRule::builder()
+                        .msg_type(zbus::message::Type::Signal)
+                        .interface("org.a11y.atspi.Cache")
+                        .unwrap()
+                        .path(cache_path())
+                        .unwrap()
+                        .build();
+                    let mut signals = zbus::MessageStream::for_match_rule(rule, &registry, Some(2))
+                        .await
+                        .unwrap();
+                    let cache = CacheProxy::builder(&registry)
+                        .destination(bus.unique_name().as_str())
+                        .unwrap()
+                        .build()
+                        .await
+                        .unwrap();
+                    let item = cache.get_items().await.unwrap().remove(0);
+                    bus.emit_cache_signal("AddAccessible", &item).await.unwrap();
+                    bus.emit_cache_signal("RemoveAccessible", &item.object)
+                        .await
+                        .unwrap();
+                    for member in ["AddAccessible", "RemoveAccessible"] {
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        let message = loop {
+                            if let Some(Some(message)) = poll_once(signals.next()).await {
+                                break message.unwrap();
+                            }
+                            assert!(Instant::now() < deadline, "cache signal missing");
+                            futures_lite::future::yield_now().await;
+                        };
+                        assert_eq!(message.header().member().unwrap().as_str(), member);
+                        // zbus normalizes a body's structure signature when reading it. Inspect
+                        // the actual header bytes that libatspi consumes instead.
+                        let data = message.data();
+                        let raw = data.bytes();
+                        let size = raw[12..16].try_into().unwrap();
+                        let size = match raw[0] {
+                            b'l' => u32::from_le_bytes(size),
+                            b'B' => u32::from_be_bytes(size),
+                            _ => panic!("unexpected D-Bus endianness"),
+                        } as usize;
+                        let expected = if member == "AddAccessible" {
+                            "((so)(so)(so)iiassusau)"
+                        } else {
+                            "(so)"
+                        };
+                        let mut signature = vec![expected.len() as u8];
+                        signature.extend_from_slice(expected.as_bytes());
+                        signature.push(0);
+                        assert!(
+                            raw[16..16 + size]
+                                .windows(signature.len())
+                                .any(|s| s == signature),
+                            "{member} has no single structure argument on the wire"
+                        );
+                        if member == "AddAccessible" {
+                            let (received,): (atspi::CacheItem,) =
+                                message.body().deserialize().unwrap();
+                            assert_eq!(received, item);
+                        } else {
+                            let (received,): (ObjectRefOwned,) =
+                                message.body().deserialize().unwrap();
+                            assert_eq!(received, item.object);
+                        }
+                    }
                 })
                 .await;
         });
