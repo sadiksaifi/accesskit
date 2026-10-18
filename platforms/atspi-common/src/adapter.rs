@@ -320,6 +320,11 @@ impl TreeChangeHandler for AdapterChangeHandler<'_> {
                 .unregister_interfaces(new_wrapper.id(), old_interfaces ^ kept_interfaces);
             self.adapter
                 .register_interfaces(new_node.id(), new_interfaces ^ kept_interfaces);
+            // AT-SPI clients cache supported interfaces from AddAccessible, including when
+            // an initially empty Terminal gains its first text run.
+            if new_interfaces != old_interfaces {
+                self.adapter.emit_cache_added(new_node.id());
+            }
             let bounds = *self.adapter.context.read_root_window_bounds();
             new_wrapper.notify_changes(&bounds, self.adapter, &old_wrapper);
             self.emit_text_selection_change(Some(old_node), new_node);
@@ -884,6 +889,31 @@ mod tests {
             assert_eq!(selected.index_path().last(), Some(&1));
             assert_eq!(tree.state().focus().unwrap().role(), Role::Terminal);
         }
+    }
+
+    #[test]
+    fn terminal_text_interface_changes_refresh_the_existing_cache_entry() {
+        let mut initial = initial_tree();
+        initial.nodes[1].1 = Node::new(Role::Terminal);
+        let (mut adapter, ops) = build(initial);
+        let terminal_id = container_id(&adapter);
+        let mut run = Node::new(Role::TextRun);
+        run.set_value("ready");
+        run.set_character_lengths(vec![1; 5]);
+        adapter.update(update(vec![
+            (
+                LocalNodeId(1),
+                with_children(Role::Terminal, &[LocalNodeId(2)]),
+            ),
+            (LocalNodeId(2), run),
+        ]));
+        assert!(ops.lock().unwrap().contains(&CacheOp::Added(terminal_id)));
+        assert!(adapter.platform_node(terminal_id).supports_text().unwrap());
+
+        ops.lock().unwrap().clear();
+        adapter.update(update(vec![(LocalNodeId(1), Node::new(Role::Terminal))]));
+        assert!(ops.lock().unwrap().contains(&CacheOp::Added(terminal_id)));
+        assert!(!adapter.platform_node(terminal_id).supports_text().unwrap());
     }
 
     #[test]

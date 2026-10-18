@@ -33,6 +33,7 @@ dependency for the core's serialization regressions.
 - `fix(atspi): start the method dispatcher before registry embedding`
 - `fix(atspi): treat a new tab list's or tree's selection as initial, not changed`
 - `fix(atspi): keep navigation selection notifications within keyboard focus`
+- `fix(atspi): refresh cached interfaces when terminal text becomes available`
 
 The context menu patch implements `accessibilityPerformShowMenu` and allows the selector only
 when the node supports `Action::ShowContextMenu` under the adapter's filter. AppKit discovers
@@ -64,6 +65,11 @@ and Orca presents that item through the event. Existing navigation containers em
 only while keyboard focus is inside them. Their selected state remains queryable when focus moves
 elsewhere. This also prevents creating or selecting a Workspace from moving Orca out of the Terminal
 after the application's focus event. The adapter's selection tests cover each case.
+
+The interface cache patch refreshes an existing AT-SPI cache entry when its supported interfaces
+change. A server Terminal can appear before its first text run. Without the refresh, Orca retains
+the initial interface list and cannot query its caret or echo typed characters after Text becomes
+available. The adapter regression checks Text appearing and disappearing on the same Terminal.
 
 The `alloc::vec` patch adds an import required by the shared-children test when the core
 builds without its optional standard-library features. It was also applied to the retained copy
