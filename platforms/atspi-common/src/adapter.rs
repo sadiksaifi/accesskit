@@ -262,6 +262,23 @@ impl<'a> AdapterChangeHandler<'a> {
             if self.removed_nodes.contains(id) || self.added_navigation_containers.contains(id) {
                 continue;
             }
+            let tree = self.adapter.context.read_tree();
+            let Some(container) = tree.state().node_by_id(*id) else {
+                continue;
+            };
+            // Navigation selections also track the location shown by another control. Orca
+            // treats their notifications as focus changes even when that control has focus.
+            if matches!(
+                container.role(),
+                Role::TabList | Role::Tree | Role::TreeGrid
+            ) && !tree
+                .state()
+                .focus()
+                .is_some_and(|focus| focus.is_descendant_of(&container))
+            {
+                continue;
+            }
+            drop(tree);
             self.adapter
                 .emit_object_event(*id, ObjectEvent::SelectionChanged);
         }
@@ -796,10 +813,13 @@ mod tests {
                 container,
                 &[(item_role, true), (item_role, false)],
             ));
-            adapter.update(update(vec![
+            adapter.update_window_focus_state(true);
+            let mut selection = update(vec![
                 (LocalNodeId(2), item(item_role, false)),
                 (LocalNodeId(3), item(item_role, true)),
-            ]));
+            ]);
+            selection.focus = LocalNodeId(3);
+            adapter.update(selection);
             let changes = selection_changes(&ops.lock().unwrap());
             assert_eq!(changes, vec![container_id(&adapter)], "{container:?}");
         }
@@ -812,15 +832,57 @@ mod tests {
                 container,
                 &[(item_role, false), (item_role, false)],
             ));
-            adapter.update(update(vec![
+            adapter.update_window_focus_state(true);
+            let mut selection = update(vec![
                 (
                     LocalNodeId(1),
                     with_children(container, &[LocalNodeId(2), LocalNodeId(3), LocalNodeId(4)]),
                 ),
                 (LocalNodeId(4), item(item_role, true)),
-            ]));
+            ]);
+            selection.focus = LocalNodeId(4);
+            adapter.update(selection);
             let changes = selection_changes(&ops.lock().unwrap());
             assert_eq!(changes, vec![container_id(&adapter)], "{container:?}");
+        }
+    }
+
+    #[test]
+    fn navigation_selection_outside_focus_updates_state_without_a_focus_stealing_event() {
+        for (container, item_role) in NAVIGATION_CONTAINERS {
+            let mut initial = container_tree(container, &[(item_role, true), (item_role, false)]);
+            initial.nodes[0]
+                .1
+                .set_children(vec![LocalNodeId(1), LocalNodeId(4)]);
+            initial
+                .nodes
+                .push((LocalNodeId(4), Node::new(Role::Terminal)));
+            let (mut adapter, ops) = build(initial);
+            adapter.update_window_focus_state(true);
+            let mut selection = update(vec![
+                (LocalNodeId(2), item(item_role, false)),
+                (LocalNodeId(3), item(item_role, true)),
+            ]);
+            selection.focus = LocalNodeId(4);
+            adapter.update(selection);
+
+            assert!(
+                selection_changes(&ops.lock().unwrap()).is_empty(),
+                "{container:?}"
+            );
+            let tree = adapter.context.read_tree();
+            let selected = tree
+                .state()
+                .root()
+                .children()
+                .next()
+                .unwrap()
+                .items(&crate::filters::filter)
+                .find(|item| item.is_selected() == Some(true))
+                .unwrap();
+            assert_eq!(selected.role(), item_role);
+            assert_eq!(selected.index_path().last(), Some(&1));
+            assert_eq!(tree.state().focus().unwrap().role(), Role::Terminal);
         }
     }
 

@@ -32,6 +32,7 @@ dependency for the core's serialization regressions.
 - `fix(atspi): publish the application root before registry embedding`
 - `fix(atspi): start the method dispatcher before registry embedding`
 - `fix(atspi): treat a new tab list's or tree's selection as initial, not changed`
+- `fix(atspi): keep navigation selection notifications within keyboard focus`
 
 The context menu patch implements `accessibilityPerformShowMenu` and allows the selector only
 when the node supports `Action::ShowContextMenu` under the adapter's filter. AppKit discovers
@@ -59,8 +60,10 @@ When SpaceTerm published its tab list and Workspace tree at window creation, Orc
 event after the Terminal's focus event, leave the Terminal, and drop its text events. A tab list or
 tree shows the current location, so its selection on arrival is state, not a change. Menus and list
 boxes still announce the selection they open with, because they open for the person to choose from
-and Orca presents that item through the event. Selection changes in existing containers, including
-a selected item added to one, still emit the event. The adapter's selection tests cover each case.
+and Orca presents that item through the event. Existing navigation containers emit selection changes
+only while keyboard focus is inside them. Their selected state remains queryable when focus moves
+elsewhere. This also prevents creating or selecting a Workspace from moving Orca out of the Terminal
+after the application's focus event. The adapter's selection tests cover each case.
 
 The `alloc::vec` patch adds an import required by the shared-children test when the core
 builds without its optional standard-library features. It was also applied to the retained copy
